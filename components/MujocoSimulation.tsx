@@ -3,9 +3,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { Activity, AlertTriangle, Cpu, Pause, Play, RotateCcw, SlidersHorizontal } from "lucide-react";
-import { loadMujocoModule, type MjDataHandle, type MjModelHandle, type MujocoModule } from "@/lib/mujoco/loader";
-import { getModel, SIM_MODELS, type SimModel } from "@/lib/mujoco/models";
+import { Activity, AlertTriangle, Cpu, Pause, Play, RotateCcw } from "lucide-react";
+import { Panel } from "@/components/ui/Panel";
+import { loadMujocoModule, stageAndLoad, type MjDataHandle, type MjModelHandle, type MujocoModule } from "@/lib/mujoco/loader";
+import { getModel, SIM_MODELS, type SimController, type SimModel, type TelemetryChannel } from "@/lib/mujoco/models";
+import type { Incident, TimelineEvent } from "@/lib/types";
 
 // MuJoCo geom type codes (this WASM build).
 const PLANE = 0;
@@ -14,27 +16,33 @@ const CAPSULE = 3;
 const ELLIPSOID = 4;
 const CYLINDER = 5;
 const BOX = 6;
+const MESH = 7;
+// Geoms in collision/site groups (>= 3) are hidden — we render only visuals.
+const MAX_VISIBLE_GROUP = 2;
 
-/** Build a Three.js geometry for a MuJoCo geom, baking in MuJoCo's local-Z
+// Scratch matrix reused across frames to avoid per-frame allocation.
+const SCRATCH_M4 = new THREE.Matrix4();
+
+/** Build a Three.js geometry for a primitive geom, baking in MuJoCo's local-Z
  *  axis convention (Three's capsule/cylinder default to local Y). */
-function buildGeometry(type: number, sx: number, sy: number, sz: number): THREE.BufferGeometry | null {
+function buildPrimitive(type: number, sx: number, sy: number, sz: number): THREE.BufferGeometry | null {
   switch (type) {
     case PLANE:
-      return new THREE.PlaneGeometry(sx > 0 ? sx * 2 : 10, sy > 0 ? sy * 2 : 10);
+      return new THREE.PlaneGeometry(sx > 0 ? sx * 2 : 12, sy > 0 ? sy * 2 : 12);
     case SPHERE:
-      return new THREE.SphereGeometry(sx, 28, 18);
+      return new THREE.SphereGeometry(sx, 24, 16);
     case CAPSULE: {
-      const g = new THREE.CapsuleGeometry(sx, sy * 2, 10, 20);
+      const g = new THREE.CapsuleGeometry(sx, sy * 2, 8, 16);
       g.rotateX(Math.PI / 2);
       return g;
     }
     case ELLIPSOID: {
-      const g = new THREE.SphereGeometry(1, 28, 18);
+      const g = new THREE.SphereGeometry(1, 24, 16);
       g.scale(sx, sy, sz);
       return g;
     }
     case CYLINDER: {
-      const g = new THREE.CylinderGeometry(sx, sx, sy * 2, 28);
+      const g = new THREE.CylinderGeometry(sx, sx, sy * 2, 24);
       g.rotateX(Math.PI / 2);
       return g;
     }
@@ -45,7 +53,40 @@ function buildGeometry(type: number, sx: number, sy: number, sz: number): THREE.
   }
 }
 
+/** Build a Three.js geometry from a compiled MuJoCo mesh (vertices/normals/faces
+ *  are sliced per-mesh; face indices are local 0-based within the mesh). */
+function buildMesh(model: MjModelHandle, dataId: number): THREE.BufferGeometry {
+  const va = model.mesh_vertadr[dataId];
+  const vn = model.mesh_vertnum[dataId];
+  const fa = model.mesh_faceadr[dataId];
+  const fn = model.mesh_facenum[dataId];
+  const positions = new Float32Array(vn * 3);
+  const normals = new Float32Array(vn * 3);
+  for (let i = 0; i < vn * 3; i++) {
+    positions[i] = model.mesh_vert[va * 3 + i];
+    normals[i] = model.mesh_normal[va * 3 + i];
+  }
+  const indices = new Uint32Array(fn * 3);
+  for (let i = 0; i < fn * 3; i++) indices[i] = model.mesh_face[fa * 3 + i];
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  g.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+  g.setIndex(new THREE.BufferAttribute(indices, 1));
+  return g;
+}
+
+/** Resolve a geom's display colour from its material, falling back to geom_rgba. */
+function geomColor(model: MjModelHandle, i: number): { color: THREE.Color; opacity: number } {
+  const mid = model.geom_matid[i];
+  const src = mid >= 0 ? { arr: model.mat_rgba, off: mid * 4 } : { arr: model.geom_rgba, off: i * 4 };
+  return {
+    color: new THREE.Color(src.arr[src.off], src.arr[src.off + 1], src.arr[src.off + 2]),
+    opacity: src.arr[src.off + 3],
+  };
+}
+
 type Status = "loading" | "ready" | "error";
+type Chip = { label: string; value: string; warn?: boolean };
 
 interface SceneRefs {
   renderer: THREE.WebGLRenderer;
@@ -53,9 +94,8 @@ interface SceneRefs {
   camera: THREE.PerspectiveCamera;
   controls: OrbitControls;
   group: THREE.Group;
-  meshes: THREE.Mesh[];
+  meshes: { mesh: THREE.Mesh; geomIndex: number }[];
   raf: number;
-  resizeObserver?: ResizeObserver;
 }
 
 interface SimRefs {
@@ -64,16 +104,27 @@ interface SimRefs {
   data: MjDataHandle | null;
 }
 
-export function MujocoSimulation() {
+export interface MujocoSimulationProps {
+  /** The incident in focus — used as the base when capturing twin evidence. */
+  incident?: Incident;
+  /** Fold a fault reproduced in the twin back into the investigation. */
+  onEvidenceChange?: (next: Incident) => void;
+}
+
+export function MujocoSimulation({ incident, onEvidenceChange }: MujocoSimulationProps = {}) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const sceneRef = useRef<SceneRefs | null>(null);
   const simRef = useRef<SimRefs>({ mod: null, model: null, data: null });
+  const controllerRef = useRef<SimController | null>(null);
 
-  // Mutable values the rAF loop reads without re-binding its closure.
   const runningRef = useRef(true);
   const metaRef = useRef<SimModel>(getModel(SIM_MODELS[0].id));
   const prevModelIdRef = useRef<string | null>(null);
+  const buildIdRef = useRef(0);
   const frameRef = useRef(0);
+  // Mirror state into refs so the async build and rAF loop read fresh values.
+  const failuresRef = useRef<string[]>([]);
+  const ctrlRef = useRef<number[]>(SIM_MODELS[0].controls.map((c) => c.default));
 
   const [status, setStatus] = useState<Status>("loading");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -82,108 +133,81 @@ export function MujocoSimulation() {
   const [activeFailures, setActiveFailures] = useState<string[]>([]);
   const [ctrlValues, setCtrlValues] = useState<number[]>(SIM_MODELS[0].controls.map((c) => c.default));
   const [telemetry, setTelemetry] = useState<number[]>([]);
+  const [chips, setChips] = useState<Chip[]>([]);
   const [simTime, setSimTime] = useState(0);
+  const [captured, setCaptured] = useState(false);
 
   const model = getModel(selectedId);
   metaRef.current = model;
 
-  // ── (Re)build the MuJoCo model/data and the Three.js meshes ──────────────
-  const rebuild = useCallback(
-    (modelDef: SimModel, failures: string[], resetControls: boolean, controlsToApply: number[]) => {
+  const ctx = useCallback(() => {
+    const { mod, model: m, data: d } = simRef.current;
+    return mod && m && d ? { mod, model: m, data: d } : null;
+  }, []);
+
+  // ── (Re)build model + meshes (async: stages mesh assets on first use) ──────
+  const buildModel = useCallback(
+    async (modelDef: SimModel, failures: string[], resetControls: boolean) => {
       const mod = simRef.current.mod;
       const sc = sceneRef.current;
       if (!mod || !sc) return;
+      const myBuild = ++buildIdRef.current;
+      setStatus("loading");
 
-      // Free the previous handles before allocating new ones.
-      simRef.current.data?.delete();
-      simRef.current.model?.delete();
+      try {
+        const m = await stageAndLoad(mod, modelDef.assets);
+        if (myBuild !== buildIdRef.current) {
+          m.delete();
+          return; // a newer build superseded this one
+        }
+        for (const f of modelDef.failures) {
+          if (f.apply && failures.includes(f.id)) f.apply(m);
+        }
 
-      mod.FS.writeFile(`/${modelDef.id}.xml`, modelDef.xml);
-      const m = mod.MjModel.loadFromXML(`/${modelDef.id}.xml`);
-      if (!m) throw new Error(`Failed to compile model "${modelDef.label}".`);
-
-      for (const f of modelDef.failures) {
-        if (failures.includes(f.id)) f.apply(m);
-      }
-
-      const d = new mod.MjData(m);
-      if (modelDef.initialQpos) {
-        modelDef.initialQpos.forEach((v, i) => (d.qpos[i] = v));
-        mod.mj_forward(m, d);
-      }
-      const applied = resetControls ? modelDef.controls.map((c) => c.default) : controlsToApply;
-      modelDef.controls.forEach((c, ci) => {
-        for (const idx of c.indices) d.ctrl[idx] = applied[ci];
-      });
-      // Compute kinematics so geom_xpos/xmat are valid for the first paint.
-      mod.mj_forward(m, d);
-
-      simRef.current.model = m;
-      simRef.current.data = d;
-
-      // Rebuild meshes from the model's geoms.
-      for (const mesh of sc.meshes) {
-        sc.group.remove(mesh);
-        mesh.geometry.dispose();
-        (mesh.material as THREE.Material).dispose();
-      }
-      sc.meshes = [];
-      for (let i = 0; i < m.ngeom; i++) {
-        const type = m.geom_type[i];
-        const geom = buildGeometry(type, m.geom_size[i * 3], m.geom_size[i * 3 + 1], m.geom_size[i * 3 + 2]);
-        if (!geom) continue;
-        const r = m.geom_rgba[i * 4];
-        const g = m.geom_rgba[i * 4 + 1];
-        const b = m.geom_rgba[i * 4 + 2];
-        const a = m.geom_rgba[i * 4 + 3];
-        const isFloor = type === PLANE;
-        const material = new THREE.MeshStandardMaterial({
-          color: new THREE.Color(r, g, b),
-          metalness: isFloor ? 0 : 0.15,
-          roughness: isFloor ? 0.95 : 0.55,
-          transparent: a < 1,
-          opacity: a,
+        const d = new mod.MjData(m);
+        modelDef.homeQpos.forEach((v, i) => (d.qpos[i] = v));
+        const applied = resetControls ? modelDef.controls.map((c) => c.default) : ctrlRef.current;
+        modelDef.controls.forEach((c, ci) => {
+          if (c.indices) for (const idx of c.indices) d.ctrl[idx] = applied[ci];
         });
-        const mesh = new THREE.Mesh(geom, material);
-        mesh.matrixAutoUpdate = false;
-        mesh.castShadow = !isFloor;
-        mesh.receiveShadow = true;
-        sc.group.add(mesh);
-        sc.meshes.push(mesh);
-      }
+        mod.mj_forward(m, d);
 
-      // Frame the camera only when the model itself changes.
-      if (prevModelIdRef.current !== modelDef.id) {
-        const { distance, azimuth, elevation, target } = modelDef.camera;
-        const t = new THREE.Vector3(target[0], target[1], target[2]);
-        sc.camera.position.set(
-          t.x + distance * Math.cos(elevation) * Math.cos(azimuth),
-          t.y + distance * Math.cos(elevation) * Math.sin(azimuth),
-          t.z + distance * Math.sin(elevation),
-        );
-        sc.controls.target.copy(t);
-        sc.controls.update();
-        prevModelIdRef.current = modelDef.id;
-      }
+        simRef.current.data?.delete();
+        simRef.current.model?.delete();
+        simRef.current.model = m;
+        simRef.current.data = d;
 
-      // Paint one frame immediately so the new model shows even before the
-      // animation loop's next tick (e.g. while paused, or if rAF is throttled).
-      const m4 = new THREE.Matrix4();
-      for (let i = 0; i < sc.meshes.length; i++) {
-        const xm = i * 9;
-        const xp = i * 3;
-        m4.set(
-          d.geom_xmat[xm + 0], d.geom_xmat[xm + 1], d.geom_xmat[xm + 2], d.geom_xpos[xp + 0],
-          d.geom_xmat[xm + 3], d.geom_xmat[xm + 4], d.geom_xmat[xm + 5], d.geom_xpos[xp + 1],
-          d.geom_xmat[xm + 6], d.geom_xmat[xm + 7], d.geom_xmat[xm + 8], d.geom_xpos[xp + 2],
-          0, 0, 0, 1,
-        );
-        sc.meshes[i].matrix.copy(m4);
-      }
-      sc.renderer.render(sc.scene, sc.camera);
+        // Controller (scripted cells) — seed flags + control params.
+        if (modelDef.makeController) {
+          const c = modelDef.makeController();
+          c.flags = new Set(failures.filter((id) => modelDef.failures.find((f) => f.id === id)?.controllerFlag));
+          c.reset({ mod, model: m, data: d });
+          modelDef.controls.forEach((ct, ci) => {
+            if (ct.param) c.setParam(ct.param, applied[ci]);
+          });
+          controllerRef.current = c;
+        } else {
+          controllerRef.current = null;
+        }
 
-      if (resetControls) setCtrlValues(applied);
-      frameRef.current = 0;
+        rebuildMeshes(sc, m);
+        if (prevModelIdRef.current !== modelDef.id) {
+          frameCamera(sc, modelDef.camera);
+          prevModelIdRef.current = modelDef.id;
+        }
+        paintFrame(sc, d);
+
+        ctrlRef.current = applied;
+        if (resetControls) setCtrlValues(applied);
+        frameRef.current = 0;
+        setErrorMsg(null);
+        setStatus("ready");
+      } catch (err) {
+        if (myBuild === buildIdRef.current) {
+          setErrorMsg(err instanceof Error ? err.message : "Failed to load the simulation.");
+          setStatus("error");
+        }
+      }
     },
     [],
   );
@@ -196,8 +220,6 @@ export function MujocoSimulation() {
     const width = mount.clientWidth || 800;
     const height = mount.clientHeight || 460;
 
-    // preserveDrawingBuffer keeps the last frame readable for screenshots and
-    // screen recordings (handy for demos) at negligible cost for these scenes.
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(width, height);
@@ -205,11 +227,10 @@ export function MujocoSimulation() {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     mount.appendChild(renderer.domElement);
     renderer.domElement.style.display = "block";
-    renderer.domElement.style.borderRadius = "0";
+    renderer.domElement.style.borderRadius = "10px";
 
     const scene = new THREE.Scene();
-
-    const camera = new THREE.PerspectiveCamera(45, width / height, 0.05, 100);
+    const camera = new THREE.PerspectiveCamera(45, width / height, 0.03, 100);
     camera.up.set(0, 0, 1); // MuJoCo is Z-up.
     camera.position.set(2, 2, 1.5);
 
@@ -217,24 +238,23 @@ export function MujocoSimulation() {
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
     controls.minDistance = 0.4;
-    controls.maxDistance = 12;
+    controls.maxDistance = 14;
 
-    // Lighting tuned to read as a clean engineering viewport.
     const hemi = new THREE.HemisphereLight(0xffffff, 0x9aa3b2, 0.85);
     scene.add(hemi);
-    const key = new THREE.DirectionalLight(0xffffff, 1.1);
+    const key = new THREE.DirectionalLight(0xffffff, 1.0);
     key.position.set(2.5, 2, 4);
     key.castShadow = true;
-    key.shadow.mapSize.set(1024, 1024);
+    key.shadow.mapSize.set(2048, 2048);
     key.shadow.camera.near = 0.5;
     key.shadow.camera.far = 20;
-    (key.shadow.camera as THREE.OrthographicCamera).left = -4;
-    (key.shadow.camera as THREE.OrthographicCamera).right = 4;
-    (key.shadow.camera as THREE.OrthographicCamera).top = 4;
-    (key.shadow.camera as THREE.OrthographicCamera).bottom = -4;
+    const sc = key.shadow.camera as THREE.OrthographicCamera;
+    sc.left = -3;
+    sc.right = 3;
+    sc.top = 3;
+    sc.bottom = -3;
     scene.add(key);
 
-    // Ground grid in the XY plane (MuJoCo floor plane).
     const grid = new THREE.GridHelper(12, 48, 0xcbd5e1, 0xe2e8f0);
     grid.rotateX(Math.PI / 2);
     grid.position.z = 0.001;
@@ -246,39 +266,23 @@ export function MujocoSimulation() {
     const refs: SceneRefs = { renderer, scene, camera, controls, group, meshes: [], raf: 0 };
     sceneRef.current = refs;
 
-    const m4 = new THREE.Matrix4();
     const animate = () => {
       refs.raf = requestAnimationFrame(animate);
-      const { mod, model: m, data: d } = simRef.current;
+      const c = simRef.current.mod && simRef.current.model && simRef.current.data;
       const meta = metaRef.current;
 
-      if (mod && m && d && runningRef.current) {
-        for (let s = 0; s < meta.realtimeSteps; s++) mod.mj_step(m, d);
+      if (c && runningRef.current) {
+        const { mod, model: m, data: d } = simRef.current;
+        const controller = controllerRef.current;
+        for (let s = 0; s < meta.realtimeSteps; s++) {
+          if (controller) controller.step({ mod: mod!, model: m!, data: d! });
+          else mod!.mj_step(m!, d!);
+        }
       }
 
-      if (m && d) {
-        for (let i = 0; i < refs.meshes.length; i++) {
-          const xm = i * 9;
-          const xp = i * 3;
-          m4.set(
-            d.geom_xmat[xm + 0], d.geom_xmat[xm + 1], d.geom_xmat[xm + 2], d.geom_xpos[xp + 0],
-            d.geom_xmat[xm + 3], d.geom_xmat[xm + 4], d.geom_xmat[xm + 5], d.geom_xpos[xp + 1],
-            d.geom_xmat[xm + 6], d.geom_xmat[xm + 7], d.geom_xmat[xm + 8], d.geom_xpos[xp + 2],
-            0, 0, 0, 1,
-          );
-          refs.meshes[i].matrix.copy(m4);
-        }
-
-        // Stream telemetry to React at ~15 Hz to keep the readouts legible.
-        if (frameRef.current % 4 === 0) {
-          const values = meta.telemetry.map((t) => {
-            if (t.source === "time") return d.time;
-            const arr = t.source === "qpos" ? d.qpos : t.source === "qvel" ? d.qvel : d.actuator_force;
-            return Number(arr[t.index]) * (t.scale ?? 1);
-          });
-          setTelemetry(values);
-          setSimTime(d.time);
-        }
+      if (simRef.current.model && simRef.current.data) {
+        applyTransforms(refs, simRef.current.data);
+        if (frameRef.current % 4 === 0) pushReadouts(meta);
         frameRef.current++;
       }
 
@@ -287,25 +291,24 @@ export function MujocoSimulation() {
     };
     animate();
 
-    const resizeObserver = new ResizeObserver(() => {
+    const ro = new ResizeObserver(() => {
       const w = mount.clientWidth;
       const h = mount.clientHeight;
-      if (w === 0 || h === 0) return;
+      if (!w || !h) return;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
     });
-    resizeObserver.observe(mount);
-    refs.resizeObserver = resizeObserver;
+    ro.observe(mount);
 
     return () => {
       cancelAnimationFrame(refs.raf);
-      resizeObserver.disconnect();
+      ro.disconnect();
       simRef.current.data?.delete();
       simRef.current.model?.delete();
       simRef.current.data = null;
       simRef.current.model = null;
-      for (const mesh of refs.meshes) {
+      for (const { mesh } of refs.meshes) {
         mesh.geometry.dispose();
         (mesh.material as THREE.Material).dispose();
       }
@@ -314,9 +317,10 @@ export function MujocoSimulation() {
       if (renderer.domElement.parentNode === mount) mount.removeChild(renderer.domElement);
       sceneRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Load the WASM module once ────────────────────────────────────────────
+  // ── Load WASM once, then build the initial model ─────────────────────────
   useEffect(() => {
     let cancelled = false;
     setStatus("loading");
@@ -325,8 +329,7 @@ export function MujocoSimulation() {
         if (cancelled) return;
         simRef.current.mod = mod;
         prevModelIdRef.current = null;
-        rebuild(metaRef.current, [], true, []);
-        setStatus("ready");
+        return buildModel(metaRef.current, [], true);
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -336,34 +339,122 @@ export function MujocoSimulation() {
     return () => {
       cancelled = true;
     };
-  }, [rebuild]);
+  }, [buildModel]);
 
   // ── Rebuild on model change ──────────────────────────────────────────────
   useEffect(() => {
-    if (status !== "ready") return;
-    try {
-      rebuild(getModel(selectedId), [], true, []);
-      setActiveFailures([]);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Simulation rebuild failed.");
-      setStatus("error");
-    }
+    if (!simRef.current.mod) return;
+    failuresRef.current = [];
+    setActiveFailures([]);
+    buildModel(getModel(selectedId), [], true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
+  // ── Per-frame helpers (defined inline to close over refs) ────────────────
+  function rebuildMeshes(sc: SceneRefs, m: MjModelHandle) {
+    for (const { mesh } of sc.meshes) {
+      sc.group.remove(mesh);
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+    }
+    sc.meshes = [];
+    for (let i = 0; i < m.ngeom; i++) {
+      if (m.geom_group[i] > MAX_VISIBLE_GROUP) continue; // hide collision geoms
+      const type = m.geom_type[i];
+      const geometry =
+        type === MESH ? buildMesh(m, m.geom_dataid[i]) : buildPrimitive(type, m.geom_size[i * 3], m.geom_size[i * 3 + 1], m.geom_size[i * 3 + 2]);
+      if (!geometry) continue;
+      const { color, opacity } = geomColor(m, i);
+      const isFloor = type === PLANE;
+      const material = new THREE.MeshStandardMaterial({
+        color,
+        metalness: isFloor ? 0 : 0.2,
+        roughness: isFloor ? 0.95 : 0.6,
+        transparent: opacity < 1,
+        opacity,
+        side: opacity < 1 ? THREE.DoubleSide : THREE.FrontSide,
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.matrixAutoUpdate = false;
+      mesh.castShadow = !isFloor && opacity >= 1;
+      mesh.receiveShadow = true;
+      sc.group.add(mesh);
+      sc.meshes.push({ mesh, geomIndex: i });
+    }
+  }
+
+  function applyTransforms(sc: SceneRefs, d: MjDataHandle) {
+    const m4 = SCRATCH_M4;
+    for (const { mesh, geomIndex } of sc.meshes) {
+      const xm = geomIndex * 9;
+      const xp = geomIndex * 3;
+      m4.set(
+        d.geom_xmat[xm + 0], d.geom_xmat[xm + 1], d.geom_xmat[xm + 2], d.geom_xpos[xp + 0],
+        d.geom_xmat[xm + 3], d.geom_xmat[xm + 4], d.geom_xmat[xm + 5], d.geom_xpos[xp + 1],
+        d.geom_xmat[xm + 6], d.geom_xmat[xm + 7], d.geom_xmat[xm + 8], d.geom_xpos[xp + 2],
+        0, 0, 0, 1,
+      );
+      mesh.matrix.copy(m4);
+    }
+  }
+
+  function paintFrame(sc: SceneRefs, d: MjDataHandle) {
+    applyTransforms(sc, d);
+    sc.renderer.render(sc.scene, sc.camera);
+  }
+
+  function frameCamera(sc: SceneRefs, cam: SimModel["camera"]) {
+    const t = new THREE.Vector3(cam.target[0], cam.target[1], cam.target[2]);
+    sc.camera.position.set(
+      t.x + cam.distance * Math.cos(cam.elevation) * Math.cos(cam.azimuth),
+      t.y + cam.distance * Math.cos(cam.elevation) * Math.sin(cam.azimuth),
+      t.z + cam.distance * Math.sin(cam.elevation),
+    );
+    sc.controls.target.copy(t);
+    sc.controls.update();
+  }
+
+  function readChannel(ch: TelemetryChannel, d: MjDataHandle, controllerTelemetry: Record<string, number>): number {
+    switch (ch.source) {
+      case "qpos":
+        return Number(d.qpos[ch.index ?? 0]) * (ch.scale ?? 1);
+      case "qvel":
+        return Number(d.qvel[ch.index ?? 0]) * (ch.scale ?? 1);
+      case "actuator_force":
+        return Number(d.actuator_force[ch.index ?? 0]) * (ch.scale ?? 1);
+      case "site":
+        return Number(d.site_xpos[(ch.index ?? 0) * 3 + (ch.axis ?? 0)]) * (ch.scale ?? 1);
+      case "controller":
+        return (controllerTelemetry[ch.key ?? ""] ?? 0) * (ch.scale ?? 1);
+    }
+  }
+
+  function pushReadouts(meta: SimModel) {
+    const c = ctx();
+    if (!c) return;
+    const controller = controllerRef.current;
+    const ctel = controller ? controller.telemetry(c) : {};
+    setTelemetry(meta.telemetry.map((ch) => readChannel(ch, c.data, ctel)));
+    setChips(controller ? controller.status(c) : []);
+    setSimTime(c.data.time);
+  }
+
+  // ── UI actions ───────────────────────────────────────────────────────────
   function toggleFailure(id: string) {
     const next = activeFailures.includes(id) ? activeFailures.filter((f) => f !== id) : [...activeFailures, id];
     setActiveFailures(next);
-    try {
-      // Preserve the operator's current control targets through the injection.
-      rebuild(getModel(selectedId), next, false, ctrlValues);
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to apply failure.");
+    failuresRef.current = next;
+    const failure = model.failures.find((f) => f.id === id);
+    if (failure?.controllerFlag && controllerRef.current) {
+      // Live toggle — no rebuild needed.
+      controllerRef.current.flags = new Set(next.filter((fid) => model.failures.find((f) => f.id === fid)?.controllerFlag));
+    } else {
+      buildModel(model, next, false); // model-mutation fault → rebuild
     }
   }
 
   function handleReset() {
-    rebuild(getModel(selectedId), activeFailures, true, []);
+    buildModel(model, failuresRef.current, true);
   }
 
   function toggleRun() {
@@ -371,36 +462,75 @@ export function MujocoSimulation() {
     setIsRunning(runningRef.current);
   }
 
-  function setControl(controlIndex: number, value: number) {
+  /** Fold the currently-reproduced fault(s) + out-of-spec telemetry into a new
+   *  incident, so the war-room agents can investigate what the twin just showed. */
+  function captureEvidence() {
+    const c = ctx();
+    if (!onEvidenceChange || !incident || !c) return;
+    const meta = metaRef.current;
+    const faults = meta.failures.filter((f) => activeFailures.includes(f.id));
+    if (!faults.length) return;
+
+    const ctel = controllerRef.current ? controllerRef.current.telemetry(c) : {};
+    const stamp = new Date().toTimeString().slice(0, 8);
+    const outOfSpec = meta.telemetry
+      .map((ch) => ({ ch, v: readChannel(ch, c.data, ctel) }))
+      .filter(({ ch, v }) => ch.nominal && (v < ch.nominal[0] || v > ch.nominal[1]));
+
+    const faultLines = faults.map((f) => `${stamp} TWIN robot="${meta.robot}" fault="${f.label}"`);
+    const obsLines = outOfSpec.map(
+      ({ ch, v }) => `${stamp} TWIN ${ch.label.replace(/[^A-Za-z0-9]+/g, "_")}=${v.toFixed(2)}${ch.unit} OUT_OF_SPEC`,
+    );
+    const safetyBreach = faults.some((f) => f.id === "overreach");
+    const notes = faults.map((f) => `Digital-twin reproduction on ${meta.robot}: ${f.label} — ${f.description}`).join("\n");
+    const event: TimelineEvent = {
+      timestamp: stamp,
+      event: `Digital twin reproduced ${faults.map((f) => f.label).join(", ")}`,
+      source: meta.robot,
+      severity: safetyBreach ? "critical" : "warning",
+    };
+
+    onEvidenceChange({
+      ...incident,
+      incidentTitle: `${meta.label}: ${faults[0].label}`,
+      machineType: meta.robot,
+      severity: safetyBreach ? "critical" : incident.severity === "low" ? "medium" : incident.severity,
+      logs: [incident.logs.trim(), ...faultLines, ...obsLines].filter(Boolean).join("\n"),
+      maintenanceNotes: [incident.maintenanceNotes.trim(), notes].filter(Boolean).join("\n"),
+      timestampedEvents: [...incident.timestampedEvents, event],
+    });
+    setCaptured(true);
+    window.setTimeout(() => setCaptured(false), 2200);
+  }
+
+  function setControl(ci: number, value: number) {
     const next = [...ctrlValues];
-    next[controlIndex] = value;
+    next[ci] = value;
     setCtrlValues(next);
-    const d = simRef.current.data;
-    if (d) {
-      for (const idx of model.controls[controlIndex].indices) d.ctrl[idx] = value;
+    ctrlRef.current = next;
+    const control = model.controls[ci];
+    if (control.param) controllerRef.current?.setParam(control.param, value);
+    else if (control.indices && simRef.current.data) {
+      for (const idx of control.indices) simRef.current.data.ctrl[idx] = value;
     }
   }
 
   return (
-    <section className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-card">
-      <header className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-100 px-5 py-4">
-        <div className="flex min-w-0 items-start gap-3">
-          <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-cyan-50 text-cyan-700 ring-1 ring-cyan-100">
-            <Cpu className="h-4 w-4" />
-          </span>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <h2 className="text-sm font-semibold text-slate-950">Live physics simulation</h2>
-              <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-[10px] font-semibold uppercase tracking-label text-emerald-700">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                WASM physics
-              </span>
-            </div>
-            <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-500">{model.description}</p>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
+    <Panel
+      title="Live physics simulation"
+      subtitle="Real industrial robots (MuJoCo Menagerie), compiled to WebAssembly — stepping in your browser."
+      icon={<Cpu className="h-4 w-4" />}
+      accent="brand"
+      bodyClassName="p-0"
+      trailing={
+        <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-[10px] font-semibold uppercase tracking-label text-emerald-700">
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+          WASM physics
+        </span>
+      }
+    >
+      {SIM_MODELS.length > 1 ? (
+        <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 px-5 py-3">
           {SIM_MODELS.map((m) => {
             const active = m.id === selectedId;
             return (
@@ -408,8 +538,8 @@ export function MujocoSimulation() {
                 key={m.id}
                 type="button"
                 onClick={() => setSelectedId(m.id)}
-                className={`rounded-md px-3 py-1.5 text-[13px] font-medium transition-colors ${
-                  active ? "bg-slate-950 text-white shadow-sm" : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                className={`rounded-lg px-3 py-1.5 text-[13px] font-medium transition-colors ${
+                  active ? "bg-brand-600 text-white shadow-sm" : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
                 }`}
               >
                 {m.label}
@@ -417,20 +547,25 @@ export function MujocoSimulation() {
             );
           })}
         </div>
-      </header>
+      ) : null}
 
-      <div className="grid lg:grid-cols-[minmax(0,1fr)_330px]">
+      <div className="flex flex-wrap items-baseline gap-x-2 px-5 pt-4">
+        <span className="text-[11px] font-semibold uppercase tracking-label text-brand-600">{model.robot}</span>
+      </div>
+      <p className="px-5 pt-1 text-[13px] leading-6 text-slate-500">{model.description}</p>
+
+      <div className="grid gap-5 p-5 lg:grid-cols-[minmax(0,1fr)_300px]">
         <div className="min-w-0">
-          <div className="relative overflow-hidden bg-[#dfe8ea]">
-            <div ref={mountRef} className="h-[340px] w-full sm:h-[500px] xl:h-[560px]" />
+          <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-gradient-to-b from-slate-50 to-white">
+            <div ref={mountRef} className="h-[320px] w-full sm:h-[460px]" />
 
             {status !== "ready" ? (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-white/75 backdrop-blur-sm">
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-white/70 backdrop-blur-sm">
                 {status === "loading" ? (
                   <>
-                    <span className="h-7 w-7 animate-spin rounded-full border-2 border-cyan-200 border-t-cyan-700" />
-                    <p className="text-[13px] font-medium text-slate-600">Loading MuJoCo runtime (~11 MB)...</p>
-                    <p className="text-xs text-slate-400">Compiling the physics engine to WebAssembly</p>
+                    <span className="h-7 w-7 animate-spin rounded-full border-2 border-brand-200 border-t-brand-600" />
+                    <p className="text-[13px] font-medium text-slate-600">Loading robot & physics engine…</p>
+                    <p className="text-xs text-slate-400">MuJoCo WASM + validated robot meshes</p>
                   </>
                 ) : (
                   <div className="flex max-w-sm items-start gap-2.5 rounded-lg border border-red-200 bg-red-50 px-3.5 py-3 text-sm text-red-800">
@@ -449,7 +584,7 @@ export function MujocoSimulation() {
                 type="button"
                 onClick={toggleRun}
                 disabled={status !== "ready"}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-950/[0.88] px-3 py-1.5 text-xs font-medium text-white shadow-sm backdrop-blur transition-colors hover:bg-slate-950 disabled:opacity-40"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900/85 px-3 py-1.5 text-xs font-medium text-white shadow-sm backdrop-blur transition-colors hover:bg-slate-900 disabled:opacity-40"
               >
                 {isRunning ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
                 {isRunning ? "Pause" : "Run"}
@@ -458,56 +593,68 @@ export function MujocoSimulation() {
                 type="button"
                 onClick={handleReset}
                 disabled={status !== "ready"}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-white/90 px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm ring-1 ring-slate-200 backdrop-blur transition-colors hover:bg-white disabled:opacity-40"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-white/85 px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm ring-1 ring-slate-200 backdrop-blur transition-colors hover:bg-white disabled:opacity-40"
               >
                 <RotateCcw className="h-3.5 w-3.5" />
                 Reset
               </button>
             </div>
 
-            <div className="absolute bottom-3 right-3 rounded-lg bg-white/90 px-2.5 py-1.5 font-mono text-[11px] tabular-nums text-slate-600 shadow-sm ring-1 ring-slate-200 backdrop-blur">
+            <div className="absolute bottom-3 right-3 rounded-lg bg-white/85 px-2.5 py-1.5 font-mono text-[11px] tabular-nums text-slate-600 shadow-sm ring-1 ring-slate-200 backdrop-blur">
               t = {simTime.toFixed(2)}s
             </div>
-            <div className="pointer-events-none absolute left-3 top-3 rounded-lg bg-white/[0.86] px-2.5 py-1 text-[10px] font-medium uppercase tracking-label text-slate-600 shadow-sm ring-1 ring-slate-200 backdrop-blur">
+            <div className="pointer-events-none absolute left-3 top-3 rounded-lg bg-white/80 px-2.5 py-1 text-[10px] font-medium uppercase tracking-label text-slate-500 shadow-sm ring-1 ring-slate-200 backdrop-blur">
               {model.tagline}
             </div>
+
+            {chips.length ? (
+              <div className="pointer-events-none absolute right-3 top-3 flex flex-col items-end gap-1">
+                {chips.map((chip) => (
+                  <span
+                    key={chip.label}
+                    className={`rounded-md px-2 py-0.5 text-[10px] font-medium shadow-sm ring-1 backdrop-blur ${
+                      chip.warn ? "bg-red-50/90 text-red-700 ring-red-200" : "bg-white/85 text-slate-600 ring-slate-200"
+                    }`}
+                  >
+                    {chip.label}: <span className="font-mono tabular-nums">{chip.value}</span>
+                  </span>
+                ))}
+              </div>
+            ) : null}
           </div>
 
-          <div className="border-t border-slate-100 px-5 py-4">
-            <div className="mb-3 flex items-center gap-2">
-              <SlidersHorizontal className="h-3.5 w-3.5 text-cyan-700" />
-              <p className="text-[11px] font-semibold uppercase tracking-label text-slate-500">Actuator commands</p>
-            </div>
-            <div className="grid gap-4 lg:grid-cols-2">
-              {model.controls.map((c, ci) => (
-                <div key={c.label}>
-                  <div className="flex items-center justify-between gap-3 text-xs">
-                    <span className="font-medium text-slate-600">{c.label}</span>
-                    <span className="font-mono tabular-nums text-slate-500">
-                      {ctrlValues[ci]?.toFixed(c.step < 0.01 ? 3 : 2)} {c.unit}
-                    </span>
-                  </div>
-                  <input
-                    type="range"
-                    min={c.min}
-                    max={c.max}
-                    step={c.step}
-                    value={ctrlValues[ci] ?? c.default}
-                    onChange={(e) => setControl(ci, Number(e.target.value))}
-                    disabled={status !== "ready"}
-                    className="mt-2 h-1.5 w-full cursor-pointer appearance-none rounded-full bg-slate-200 accent-cyan-700 disabled:opacity-40"
-                  />
+          <div className="mt-4 space-y-3">
+            <p className="text-[11px] font-semibold uppercase tracking-label text-slate-400">
+              {model.controls.some((c) => c.param) ? "Process controls" : "Joint commands"}
+            </p>
+            {model.controls.map((c, ci) => (
+              <div key={c.label}>
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-medium text-slate-600">{c.label}</span>
+                  <span className="font-mono tabular-nums text-slate-500">
+                    {ctrlValues[ci]?.toFixed(c.step < 0.01 ? 3 : 2)} {c.unit}
+                  </span>
                 </div>
-              ))}
-            </div>
+                <input
+                  type="range"
+                  min={c.min}
+                  max={c.max}
+                  step={c.step}
+                  value={ctrlValues[ci] ?? c.default}
+                  onChange={(e) => setControl(ci, Number(e.target.value))}
+                  disabled={status !== "ready"}
+                  className="mt-1.5 h-1.5 w-full cursor-pointer appearance-none rounded-full bg-slate-200 accent-brand-600 disabled:opacity-40"
+                />
+              </div>
+            ))}
           </div>
         </div>
 
-        <aside className="min-w-0 border-t border-slate-200 bg-slate-50/70 p-5 lg:border-l lg:border-t-0">
+        <div className="min-w-0 space-y-4">
           <div>
             <div className="mb-2 flex items-center gap-1.5">
-              <Activity className="h-3.5 w-3.5 text-cyan-700" />
-              <p className="text-[11px] font-semibold uppercase tracking-label text-slate-500">Live state</p>
+              <Activity className="h-3.5 w-3.5 text-brand-600" />
+              <p className="text-[11px] font-semibold uppercase tracking-label text-slate-400">Live state</p>
             </div>
             <div className="space-y-1.5">
               {model.telemetry.map((t, i) => {
@@ -517,13 +664,13 @@ export function MujocoSimulation() {
                   <div
                     key={t.label}
                     className={`flex items-center justify-between rounded-lg border px-3 py-2 ${
-                      outOfSpec ? "border-red-200 bg-red-50/80" : "border-slate-200 bg-white"
+                      outOfSpec ? "border-red-200 bg-red-50/70" : "border-slate-200 bg-slate-50/60"
                     }`}
                   >
                     <span className="text-xs text-slate-600">{t.label}</span>
-                    <span className={`font-mono text-[13px] font-medium tabular-nums ${outOfSpec ? "text-red-600" : "text-slate-950"}`}>
+                    <span className={`font-mono text-[13px] font-medium tabular-nums ${outOfSpec ? "text-red-600" : "text-slate-900"}`}>
                       {value.toFixed(2)}
-                      <span className="ml-1 text-[10px] font-normal text-slate-400">{t.unit}</span>
+                      {t.unit ? <span className="ml-1 text-[10px] font-normal text-slate-400">{t.unit}</span> : null}
                     </span>
                   </div>
                 );
@@ -531,10 +678,10 @@ export function MujocoSimulation() {
             </div>
           </div>
 
-          <div className="mt-5 border-t border-slate-200 pt-5">
+          <div>
             <div className="mb-2 flex items-center gap-1.5">
               <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
-              <p className="text-[11px] font-semibold uppercase tracking-label text-slate-500">Inject failure</p>
+              <p className="text-[11px] font-semibold uppercase tracking-label text-slate-400">Inject failure</p>
             </div>
             <div className="space-y-2">
               {model.failures.map((f) => {
@@ -560,14 +707,21 @@ export function MujocoSimulation() {
                 );
               })}
             </div>
-            {activeFailures.length > 0 ? (
-              <p className="mt-2 text-[11px] leading-4 text-amber-700">
-                {activeFailures.length} fault{activeFailures.length > 1 ? "s" : ""} injected. Watch the live state drift out of its nominal band.
-              </p>
+
+            {onEvidenceChange ? (
+              <button
+                type="button"
+                onClick={captureEvidence}
+                disabled={status !== "ready" || !activeFailures.length}
+                className="mt-3 w-full rounded-lg bg-brand-600 px-3 py-2 text-[13px] font-medium text-white shadow-sm transition-colors hover:bg-brand-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+                title={activeFailures.length ? "Send this reproduced fault into the investigation" : "Inject a fault first"}
+              >
+                {captured ? "Captured to incident ✓" : "Capture to incident evidence"}
+              </button>
             ) : null}
           </div>
-        </aside>
+        </div>
       </div>
-    </section>
+    </Panel>
   );
 }

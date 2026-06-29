@@ -1,5 +1,5 @@
 import type { ChatMessage } from "./cerebras";
-import type { AgentDisplay, AgentProfile, Incident } from "./types";
+import type { AgentDisplay, AgentProfile, Incident, PriorIncidentContext } from "./types";
 
 export const AGENT_PROFILES: AgentProfile[] = [
   {
@@ -53,15 +53,51 @@ export function createEmptyAgents(): AgentDisplay[] {
   }));
 }
 
-function formatIncidentEvidence(incident: Incident, imageDataUrl?: string, visionFindings?: string[]) {
+/** Render past similar incidents as priors the agents may use, while making clear current evidence overrides them. */
+function formatPriorIncidents(priorIncidents?: PriorIncidentContext[]): string {
+  if (!priorIncidents || priorIncidents.length === 0) {
+    return [
+      "Site incident history:",
+      "No similar past incidents are on record for this machine. Treat this as a first-occurrence pattern.",
+    ].join("\n");
+  }
+  const lines = priorIncidents.map((prior, index) => {
+    const confirmed = prior.confirmedRootCause
+      ? ` CONFIRMED root cause (resolved by a technician): ${prior.confirmedRootCause}.`
+      : "";
+    const fix = prior.resolvedFix ? ` Fix that worked: ${prior.resolvedFix}.` : "";
+    return `${index + 1}. "${prior.title}" on a ${prior.machineType} (severity ${prior.severity}). Previously diagnosed as: ${prior.diagnosedRootCause}.${confirmed}${fix}`;
+  });
+  return [
+    "Site incident history (similar past failures retrieved from FactoryLens memory):",
+    ...lines,
+    "",
+    "How to use this history:",
+    "- Treat these as PRIORS, not ground truth. The current evidence always overrides them.",
+    "- If a prior with a CONFIRMED resolution closely matches the current evidence, surface it as a leading hypothesis and reference it, but still demand the confirming test before recommending the same fix.",
+    "- If the current evidence contradicts the priors, say so explicitly rather than forcing a match.",
+  ].join("\n");
+}
+
+function formatIncidentEvidence(
+  incident: Incident,
+  imageDataUrl?: string,
+  visionFindings?: string[],
+  priorIncidents?: PriorIncidentContext[],
+) {
+  const isSimulationEvidence = incident.id.startsWith("simulation-");
   return [
     "Run a full FactoryLens multi-agent investigation.",
     "",
     "FactoryLens positioning:",
     "FactoryLens is an AI War Room for Industrial Failures. It turns incident evidence into a timeline, evidence graph, ranked root causes, missing data requests, safety warnings, and a final Incident Commander repair decision.",
     "",
-    "Synthetic data note:",
-    "These are synthetic industrial incidents modeled after real robotics, PLC, and field-maintenance failure patterns.",
+    "Evidence source note:",
+    isSimulationEvidence
+      ? "This incident payload was emitted by the in-browser MuJoCo digital twin. Treat the logs as the authoritative sensor/control evidence for the selected simulation state."
+      : "These are synthetic industrial incidents modeled after real robotics, PLC, and field-maintenance failure patterns.",
+    "",
+    formatPriorIncidents(priorIncidents),
     "",
     "Hard rules:",
     "- Be technical and concise.",
@@ -73,6 +109,7 @@ function formatIncidentEvidence(incident: Incident, imageDataUrl?: string, visio
     "- Do not provide unsafe repair instructions.",
     "- Do not sound like a generic chatbot.",
     "- Treat protective trips and emergency stops as safety signals, not nuisances to bypass.",
+    "- If the supplied logs say fault_status=none, state=nominal, state=running_ok, or no_active_fault_detected=true, conclude that no active fault is detected; do not invent a root cause or repair plan.",
     "",
     "Agent roster:",
     AGENT_PROFILES.map((agent) => `- ${agent.id}: ${agent.name} - ${agent.role}`).join("\n"),
@@ -118,13 +155,18 @@ function formatIncidentEvidence(incident: Incident, imageDataUrl?: string, visio
   ].join("\n");
 }
 
-export function buildFullInvestigationMessages(incident: Incident, imageDataUrl?: string, visionFindings?: string[]): ChatMessage[] {
+export function buildFullInvestigationMessages(
+  incident: Incident,
+  imageDataUrl?: string,
+  visionFindings?: string[],
+  priorIncidents?: PriorIncidentContext[],
+): ChatMessage[] {
   const userContent: ChatMessage["content"] = imageDataUrl
     ? [
-        { type: "text", text: formatIncidentEvidence(incident, imageDataUrl, visionFindings) },
+        { type: "text", text: formatIncidentEvidence(incident, imageDataUrl, visionFindings, priorIncidents) },
         { type: "image_url", image_url: { url: imageDataUrl } },
       ]
-    : formatIncidentEvidence(incident, undefined, visionFindings);
+    : formatIncidentEvidence(incident, undefined, visionFindings, priorIncidents);
 
   return [
     {
@@ -189,6 +231,43 @@ export function buildVisionMessages(incident: Incident, imageDataUrl: string): C
         { type: "text", text: instructions },
         { type: "image_url", image_url: { url: imageDataUrl } },
       ],
+    },
+  ];
+}
+
+/** Recovery — chooses ONE executable action from the cell's action menu to clear the fault. */
+export function buildRecoveryMessages(
+  incidentTitle: string,
+  diagnosis: string,
+  actions: { id: string; description: string }[],
+): ChatMessage[] {
+  const menu = actions.map((a) => `- ${a.id}: ${a.description}`).join("\n");
+  return [
+    {
+      role: "system",
+      content:
+        "You are the FactoryLens Recovery agent for a robotic work cell. Given a diagnosed fault, you choose " +
+        "exactly ONE recovery action from the provided menu and explain why. Safety is the top priority: never " +
+        "choose an action that continues motion toward a hazard or keeps a straining drive energised. Prefer the " +
+        "action that physically clears the fault while protecting people and equipment. Return JSON only.",
+    },
+    {
+      role: "user",
+      content: [
+        `Incident: ${incidentTitle}`,
+        "",
+        "Diagnosed cause (from the investigation):",
+        diagnosis || "(no diagnosis text available)",
+        "",
+        "Available recovery actions (choose exactly one by id):",
+        menu,
+        "",
+        "Return JSON:",
+        "- actionId: the id of the single best recovery action from the menu above.",
+        "- rationale: why this action addresses the diagnosed cause.",
+        "- expectedOutcome: what the cell state should look like after it succeeds.",
+        "- safetyConsiderations: the hazard you are protecting against and how this action avoids it.",
+      ].join("\n"),
     },
   ];
 }

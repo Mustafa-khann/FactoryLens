@@ -12,6 +12,7 @@ import {
   type ModelComparison,
   type ModelProvider,
   type PipelineTelemetry,
+  type PriorIncidentContext,
   type ReasoningEffort,
   type SkepticReview,
   type VisionObservations,
@@ -193,9 +194,10 @@ async function runSynthesisAgent(
   telemetry: Telemetry,
   incident: Parameters<typeof buildFullInvestigationMessages>[0],
   visionFindings: string[],
+  priorIncidents?: PriorIncidentContext[],
 ): Promise<{ result: InvestigationResult; warning?: string }> {
   const first = await runtime.call({
-    messages: buildFullInvestigationMessages(incident, undefined, visionFindings),
+    messages: buildFullInvestigationMessages(incident, undefined, visionFindings, priorIncidents),
     responseFormat: investigationResultResponseFormat,
     temperature: 0.2,
     maxTokens: 5000,
@@ -285,14 +287,14 @@ function applySkepticReview(result: InvestigationResult, skeptic: SkepticOutput)
 export async function runInvestigationPipeline(
   incident: Parameters<typeof buildFullInvestigationMessages>[0],
   imageDataUrl?: string,
-  options: { provider?: ModelProvider } = {},
+  options: { provider?: ModelProvider; priorIncidents?: PriorIncidentContext[] } = {},
 ): Promise<AnalysisResponse> {
   const runtime = getProviderRuntime(options.provider ?? "cerebras");
   const telemetry = new Telemetry(runtime);
   const startedAt = Date.now();
 
   const vision = await runVisionAgent(runtime, telemetry, incident, imageDataUrl);
-  const { result: synthesizedRaw, warning } = await runSynthesisAgent(runtime, telemetry, incident, vision.observations);
+  const { result: synthesizedRaw, warning } = await runSynthesisAgent(runtime, telemetry, incident, vision.observations, options.priorIncidents);
   const synthesized = normalizeConfidences(synthesizedRaw);
 
   const withVision: InvestigationResult = { ...synthesized, visionObservations: vision };
@@ -340,6 +342,7 @@ function summarizeModelComparison(analysis: AnalysisResponse): ModelComparison {
 export async function runGeminiModelComparison(
   incident: Parameters<typeof buildFullInvestigationMessages>[0],
   imageDataUrl?: string,
+  options: { priorIncidents?: PriorIncidentContext[] } = {},
 ): Promise<ModelComparison> {
   if (!process.env.GEMINI_API_KEY) {
     return {
@@ -353,7 +356,7 @@ export async function runGeminiModelComparison(
   }
 
   try {
-    const analysis = await runInvestigationPipeline(incident, imageDataUrl, { provider: "gemini" });
+    const analysis = await runInvestigationPipeline(incident, imageDataUrl, { provider: "gemini", priorIncidents: options.priorIncidents });
     return summarizeModelComparison(analysis);
   } catch (error) {
     return {

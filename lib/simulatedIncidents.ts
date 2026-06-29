@@ -310,6 +310,19 @@ export function generateSyntheticIncident(machineType?: string): Incident {
 }
 
 export function getGraphSeed(incident: Incident): string[] {
+  if (incident.id.startsWith("simulation-")) {
+    const corpus = `${incident.logs} ${incident.expectedRootCause ?? ""}`.toLowerCase();
+    if (/fault_status=none|no_active_fault_detected|state=nominal/.test(corpus)) return ["simulation selected", "nominal telemetry", "no active fault"];
+    if (corpus.includes("driveline-seizure")) return ["roller rate collapse", "drive torque spike", "PLC line stop", "drive-line bearing seizure"];
+    if (corpus.includes("belt-slip")) return ["roller speed nominal", "crate velocity low", "traction lost", "roller surface contamination"];
+    if (corpus.includes("shoulder-friction")) return ["shoulder position error", "friction estimate high", "protective stop", "shoulder bearing friction"];
+    if (corpus.includes("elbow-gain-loss")) return ["elbow force low", "position error", "following error", "elbow actuator gain loss"];
+    if (corpus.includes("wrist-damping-loss")) return ["wrist rate spike", "oscillation", "motion warning", "wrist damping loss"];
+    if (corpus.includes("grip-gain-loss")) return ["grip force collapse", "part height drop", "cell warning", "grip actuator gain loss"];
+    if (corpus.includes("pad-contamination")) return ["jaw closed", "grip friction low", "part slip", "jaw pad contamination"];
+    return ["simulation evidence", "signal anomaly", "protective alarm", "injected fault"];
+  }
+
   if (incident.id === "demo-robotic-arm-j3") {
     return ["J3 vibration", "motor current spike", "torque warning", "position deviation", "emergency stop", "servo/gearbox degradation"];
   }

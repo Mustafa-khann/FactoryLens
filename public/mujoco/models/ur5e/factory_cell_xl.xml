@@ -1,0 +1,67 @@
+<mujoco model="factory_cell_ur5e_xl">
+  <!-- Web demo variant of factory_cell.xml: same real UR5e, but a longer conveyor
+       feeding SEVEN parts (two genuinely defective) into a larger, deeper drop bin.
+       Kept separate from factory_cell.xml so the Python twin (twin/cell.py, which
+       assumes three parts) is unaffected. -->
+  <compiler angle="radian" meshdir="assets" autolimits="true"/>
+  <option integrator="implicitfast"/>
+
+  <include file="ur5e.xml"/>
+
+  <visual>
+    <global offwidth="960" offheight="720"/>
+    <headlight diffuse="0.55 0.55 0.55" ambient="0.4 0.4 0.4" specular="0.1 0.1 0.1"/>
+    <quality shadowsize="4096"/>
+    <map force="0.1" zfar="30"/>
+  </visual>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.26 0.28 0.32" rgb2="0.31 0.33 0.37"
+             width="300" height="300"/>
+    <material name="floor_mat" texture="grid" texrepeat="6 6" reflectance="0.15"/>
+    <material name="belt_mat" rgba="0.13 0.14 0.17 1"/>
+    <material name="belt_rail" rgba="0.55 0.5 0.12 1"/>
+    <material name="bin_mat" rgba="0.15 0.42 0.62 0.55"/>
+    <material name="safety_mat" rgba="0.85 0.1 0.1 0.22"/>
+    <material name="part_good" rgba="0.82 0.68 0.22 1"/>
+    <material name="part_defect" rgba="0.75 0.25 0.2 1"/>
+    <material name="pedestal_mat" rgba="0.22 0.23 0.26 1"/>
+  </asset>
+
+  <worldbody>
+    <light name="key" pos="1.0 -1.0 2.4" dir="-0.4 0.4 -1" diffuse="0.7 0.7 0.7"/>
+    <light name="fill" pos="-1.2 1.2 2.0" dir="0.4 -0.4 -1" diffuse="0.3 0.3 0.3"/>
+    <camera name="cell" pos="1.75 -1.35 1.25" xyaxes="0.69 0.72 0 -0.36 0.34 0.87"/>
+
+    <geom name="floor" type="plane" size="4 4 0.1" material="floor_mat"/>
+
+    <!-- robot mounting pedestal -->
+    <geom name="pedestal" type="cylinder" pos="0 0 -0.001" size="0.13 0.02" material="pedestal_mat"/>
+
+    <!-- lengthened conveyor belt (parts queue along this toward the pick point) -->
+    <geom name="belt" type="box" pos="-0.72 0.449 0.025" size="0.62 0.09 0.025" material="belt_mat"/>
+    <geom name="belt_rail_n" type="box" pos="-0.72 0.355 0.06" size="0.62 0.008 0.04" material="belt_rail"/>
+    <geom name="belt_rail_f" type="box" pos="-0.72 0.543 0.06" size="0.62 0.008 0.04" material="belt_rail"/>
+
+    <!-- larger, deeper drop bin at the place point (shifted toward the robot so it
+         stays clear of the unchanged human keep-out zone) -->
+    <geom name="bin_floor" type="box" pos="-0.52 -0.30 0.02" size="0.19 0.15 0.02" material="bin_mat"/>
+    <geom name="bin_w1" type="box" pos="-0.52 -0.15 0.10" size="0.19 0.008 0.08" material="bin_mat"/>
+    <geom name="bin_w2" type="box" pos="-0.52 -0.45 0.10" size="0.19 0.008 0.08" material="bin_mat"/>
+    <geom name="bin_w3" type="box" pos="-0.33 -0.30 0.10" size="0.008 0.15 0.08" material="bin_mat"/>
+    <geom name="bin_w4" type="box" pos="-0.71 -0.30 0.10" size="0.008 0.15 0.08" material="bin_mat"/>
+
+    <!-- human safety keep-out zone (operator unloading the bin) — unchanged -->
+    <geom name="safety_zone" type="cylinder" pos="-0.52 -0.62 0.13" size="0.15 0.13" material="safety_mat" contype="0" conaffinity="0"/>
+    <site name="safety_center" pos="-0.52 -0.62 0.13" size="0.02" rgba="0.9 0 0 0.7"/>
+
+    <!-- seven parts queued on the belt; part2 and part5 are genuinely defective -->
+    <body name="part0" pos="-0.447 0.449 0.085"><freejoint name="part0_free"/><geom name="part0_geom" type="box" size="0.032 0.032 0.032" material="part_good" mass="0.2" friction="1 0.05 0.001"/></body>
+    <body name="part1" pos="-0.567 0.449 0.085"><freejoint name="part1_free"/><geom name="part1_geom" type="box" size="0.032 0.032 0.032" material="part_good" mass="0.2" friction="1 0.05 0.001"/></body>
+    <body name="part2" pos="-0.687 0.449 0.085"><freejoint name="part2_free"/><geom name="part2_geom" type="box" size="0.032 0.032 0.032" material="part_defect" mass="0.2" friction="1 0.05 0.001"/></body>
+    <body name="part3" pos="-0.807 0.449 0.085"><freejoint name="part3_free"/><geom name="part3_geom" type="box" size="0.032 0.032 0.032" material="part_good" mass="0.2" friction="1 0.05 0.001"/></body>
+    <body name="part4" pos="-0.927 0.449 0.085"><freejoint name="part4_free"/><geom name="part4_geom" type="box" size="0.032 0.032 0.032" material="part_good" mass="0.2" friction="1 0.05 0.001"/></body>
+    <body name="part5" pos="-1.047 0.449 0.085"><freejoint name="part5_free"/><geom name="part5_geom" type="box" size="0.032 0.032 0.032" material="part_defect" mass="0.2" friction="1 0.05 0.001"/></body>
+    <body name="part6" pos="-1.167 0.449 0.085"><freejoint name="part6_free"/><geom name="part6_geom" type="box" size="0.032 0.032 0.032" material="part_good" mass="0.2" friction="1 0.05 0.001"/></body>
+  </worldbody>
+</mujoco>

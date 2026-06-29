@@ -385,10 +385,149 @@ function applyMockSkeptic(result: InvestigationResult, imageIncluded: boolean): 
   };
 }
 
+function isHealthySimulationIncident(incident: Incident) {
+  return /fault_status=none|no_active_fault_detected=true|state=nominal|state=running_ok|no fault detected/i.test(
+    `${incident.id}\n${incident.logs}\n${incident.expectedRootCause ?? ""}`,
+  );
+}
+
+function createHealthyMockInvestigation(incident: Incident, options: MockOptions = {}, imageIncluded = false): AnalysisResponse {
+  const timeline = fallbackTimeline(incident);
+  const seed = deterministicSeed(incident);
+  const elapsedMs = options.elapsedMs ?? 450 + (seed % 320);
+  const completionTokens = 760 + (seed % 260);
+  const promptTokens = 1400 + (seed % 420);
+  const confidence = imageIncluded ? 92 : 88;
+
+  const agents: InvestigationAgent[] = AGENT_PROFILES.map((profile) => ({
+    ...profile,
+    status: "complete",
+    summary:
+      profile.id === "incident-commander"
+        ? "Decision: no active fault detected. Continue monitoring; no repair action is recommended."
+        : profile.id === "safety-officer"
+          ? "No protective trip or unsafe state is present in the supplied simulation evidence."
+          : "Reviewed the nominal simulation evidence and found no active fault signature.",
+    keyFindings:
+      profile.id === "log-forensics"
+        ? ["fault_status=none", "state=running_ok", "no_active_fault_detected=true"]
+        : ["Telemetry is nominal.", "No injected failure is active.", "No repair should be invented from healthy evidence."],
+    confidence,
+    severity: "info",
+  }));
+
+  const finalReport: FinalReport = {
+    executiveSummary: `The ${incident.machineType.toLowerCase()} simulation is operating nominally. The logs report no active injected fault and no protective trip.`,
+    mostLikelyRootCause: "No active fault detected; simulation telemetry is nominal.",
+    rankedAlternatives: ["Latent early-stage degradation not visible in the current low-rate evidence.", "Sensor/logging blind spot masking a fault."],
+    evidence: ["Logs explicitly report fault_status=none.", "Controller state is running_ok.", "FactoryLens note reports no_active_fault_detected=true."],
+    immediateDiagnosticSteps: ["Continue monitoring telemetry.", "Inject a fault or load disturbance if you want to test diagnosis behavior.", "Collect higher-rate traces only if real equipment shows symptoms."],
+    repairPlan: ["No repair action recommended.", "Do not replace components based on nominal evidence.", "Keep the machine in monitored operation."],
+    safetyWarnings: [],
+    missingData: [],
+    confidenceLevel: "high",
+    recommendedNextAction: "Continue monitoring. Inject a simulated fault to test the agent diagnosis path.",
+    humanEscalationCriteria: ["A protective alarm appears.", "Telemetry leaves the nominal band.", "An operator reports a physical symptom."],
+  };
+
+  const result: InvestigationResult = {
+    agents,
+    timeline,
+    evidenceGraph: {
+      nodes: [
+        { id: "n1", label: "fault_status=none", type: "log" },
+        { id: "n2", label: "nominal telemetry", type: "log" },
+        { id: "n3", label: "no active fault", type: "inference" },
+      ],
+      edges: [
+        { from: "n1", to: "n3", label: "supports" },
+        { from: "n2", to: "n3", label: "supports" },
+      ],
+    },
+    hypotheses: [
+      {
+        rank: 1,
+        hypothesis: "No active fault is present in the selected simulation.",
+        evidenceFor: ["fault_status=none", "state=running_ok", "no_active_fault_detected=true"],
+        evidenceAgainst: ["Only the current simulation window was supplied."],
+        confidence,
+        recommendedTest: "Inject one failure mode and rerun the investigation to verify the diagnosis path.",
+        falsificationSignal: "A protective alarm, fault_status=active, or telemetry outside the nominal band appears.",
+      },
+      {
+        rank: 2,
+        hypothesis: "A latent fault exists but is not observable in this run.",
+        evidenceFor: ["None in the supplied logs."],
+        evidenceAgainst: ["The logs explicitly report no active fault and nominal state."],
+        confidence: 12,
+        recommendedTest: "Extend monitoring duration or increase load if real symptoms exist.",
+        falsificationSignal: "Telemetry remains nominal across a longer run.",
+      },
+      {
+        rank: 3,
+        hypothesis: "The simulation evidence is incomplete.",
+        evidenceFor: ["No external image or physical inspection is attached."],
+        evidenceAgainst: ["The digital twin state is explicit and internally consistent."],
+        confidence: 8,
+        recommendedTest: "Attach physical evidence only for a real plant case.",
+        falsificationSignal: "The current twin logs remain the authoritative source for this demo.",
+      },
+    ],
+    missingData: [],
+    safetyWarnings: [],
+    finalReport,
+    xPost: `FactoryLens checked "${incident.incidentTitle}" on a ${incident.machineType}: no active fault detected in the MuJoCo evidence. Powered by @Cerebras + @googlegemma. #Gemma4 #Cerebras`,
+    discordSubmission: [
+      `**FactoryLens — Simulation Health Report**`,
+      `Simulation: ${incident.incidentTitle}`,
+      `Verdict: no active fault detected`,
+      `Confidence: high`,
+      `Next action: continue monitoring or inject a simulated fault for diagnosis.`,
+    ].join("\n"),
+    visionObservations: buildVisionObservations(imageIncluded),
+  };
+
+  const tokensPerSecond = 980 + (seed % 280);
+  const pipeline: PipelineTelemetry = {
+    provider: "cerebras",
+    providerLabel: "Cerebras",
+    model: process.env.CEREBRAS_MODEL || DEFAULT_CEREBRAS_MODEL,
+    calls: imageIncluded ? 2 : 1,
+    wallMs: elapsedMs,
+    tokensPerSecond,
+    totalTokens: promptTokens + completionTokens,
+    ttftMs: 70 + (seed % 60),
+    gpuBaselineMs: Math.round((completionTokens / 55) * 1000),
+  };
+
+  return {
+    mode: "mock",
+    warning: options.warning,
+    error: options.error,
+    elapsedMs,
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    },
+    speed: {
+      localLatencyMs: elapsedMs,
+      outputTokensPerSecond: tokensPerSecond,
+      timeToFirstTokenMs: 70 + (seed % 60),
+    },
+    pipeline,
+    result,
+  };
+}
+
 export function createMockInvestigation(incident: Incident, options: MockOptions = {}, imageIncluded = false): AnalysisResponse {
+  if (isHealthySimulationIncident(incident)) {
+    return createHealthyMockInvestigation(incident, options, imageIncluded);
+  }
+
   const timeline = fallbackTimeline(incident);
   const graphSeed = getGraphSeed(incident);
-  const rootCause = graphSeed[graphSeed.length - 1] ?? "an undetermined root cause";
+  const rootCause = incident.id.startsWith("simulation-") && incident.expectedRootCause ? incident.expectedRootCause : graphSeed[graphSeed.length - 1] ?? "an undetermined root cause";
   const agents = buildAgents(incident, timeline, rootCause, imageIncluded);
   const finalReport = buildFinalReport(incident, rootCause, timeline, imageIncluded);
 

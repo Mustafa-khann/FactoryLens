@@ -224,6 +224,26 @@ export const visionResponseFormat = {
   },
 } as const;
 
+export const recoveryResponseFormat = {
+  type: "json_schema",
+  json_schema: {
+    name: "factorylens_recovery",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["actionId", "rationale", "expectedOutcome", "safetyConsiderations"],
+      properties: {
+        // one id from the supplied action menu — validated server-side against that menu
+        actionId: { type: "string" },
+        rationale: { type: "string" },
+        expectedOutcome: { type: "string" },
+        safetyConsiderations: { type: "string" },
+      },
+    },
+  },
+} as const;
+
 export const skepticResponseFormat = {
   type: "json_schema",
   json_schema: {

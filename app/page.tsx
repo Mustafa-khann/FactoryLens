@@ -1,6 +1,5 @@
 "use client";
 
-import dynamic from "next/dynamic";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
@@ -16,6 +15,7 @@ import {
   FileText,
   Gauge,
   HelpCircle,
+  History,
   LayoutDashboard,
   ListOrdered,
   Network,
@@ -34,49 +34,45 @@ import { Button } from "@/components/ui/Button";
 import { AgentWarRoom } from "@/components/AgentWarRoom";
 import { EvidenceGraph } from "@/components/EvidenceGraph";
 import { FinalReport } from "@/components/FinalReport";
+import { HistoryPanel } from "@/components/HistoryPanel";
 import { HypothesisBattle } from "@/components/HypothesisBattle";
 import { ImageEvidencePanel } from "@/components/ImageEvidencePanel";
-import { IncidentInput } from "@/components/IncidentInput";
+import { MujocoSimulation } from "@/components/MujocoSimulation";
+import { SimilarIncidents } from "@/components/SimilarIncidents";
 import { SpeedPanel } from "@/components/SpeedPanel";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Timeline } from "@/components/Timeline";
 import { AGENT_PROFILES, createEmptyAgents } from "@/lib/agents";
-import { demoIncidents, generateSyntheticIncident } from "@/lib/simulatedIncidents";
+import {
+  clearAllIncidents,
+  clearResolution,
+  deleteIncident,
+  findSimilarIncidents,
+  loadIncidents,
+  recordResolution,
+  saveInvestigation,
+  toPriorContext,
+  type SavedIncident,
+  type ScoredIncident,
+} from "@/lib/incidentMemory";
 import type { AgentDisplay, AnalysisResponse, ImageEvidenceMeta, Incident, MissingDataRequest, SafetyWarning } from "@/lib/types";
 
-// The simulation pulls in Three.js and an 11 MB WASM physics engine, so it is
-// loaded lazily (client-only) and only when its tab is first opened.
-const MujocoSimulation = dynamic(() => import("@/components/MujocoSimulation").then((m) => m.MujocoSimulation), {
-  ssr: false,
-  loading: () => (
-    <section className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-card">
-      <div className="flex items-center justify-between gap-3 border-b border-slate-100 px-5 py-4">
-        <div className="flex items-center gap-3">
-          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-cyan-50 text-cyan-700 ring-1 ring-cyan-100">
-            <Cpu className="h-4 w-4" />
-          </span>
-          <div>
-            <h2 className="text-sm font-semibold text-slate-950">Live physics simulation</h2>
-            <p className="text-xs text-slate-500">Loading the MuJoCo workspace.</p>
-          </div>
-        </div>
-      </div>
-      <div className="flex items-center justify-center gap-3 py-16 text-sm text-slate-500">
-        <span className="h-5 w-5 animate-spin rounded-full border-2 border-cyan-200 border-t-cyan-700" />
-        Preparing simulation...
-      </div>
-    </section>
-  ),
-});
+type TabId = "overview" | "simulation" | "agents" | "timeline" | "evidence" | "hypotheses" | "safety" | "history" | "diagnostics";
 
-type TabId = "overview" | "simulation" | "agents" | "timeline" | "evidence" | "hypotheses" | "safety" | "diagnostics";
-
-function cloneIncident(incident: Incident): Incident {
-  return {
-    ...incident,
-    timestampedEvents: incident.timestampedEvents.map((event) => ({ ...event })),
-  };
-}
+// The investigation starts with no evidence — the digital twin is the only
+// source. The user reproduces a fault in the Simulation tab and captures it,
+// which replaces this placeholder and unlocks the run.
+const EMPTY_INCIDENT: Incident = {
+  id: "awaiting-evidence",
+  incidentTitle: "Awaiting simulation evidence",
+  machineType: "—",
+  severity: "low",
+  logs: "",
+  config: "",
+  maintenanceNotes: "",
+  operatorNotes: "",
+  timestampedEvents: [],
+};
 
 function formatMs(ms: number) {
   if (!ms) return "0.0s";
@@ -225,7 +221,9 @@ function SourceEventList({ incident }: { incident: Incident }) {
 }
 
 export default function Home() {
-  const [incident, setIncident] = useState<Incident>(() => cloneIncident(demoIncidents[0]));
+  const [incident, setIncident] = useState<Incident>(EMPTY_INCIDENT);
+  // True once the twin has captured evidence into the incident — gates the run.
+  const [hasEvidence, setHasEvidence] = useState(false);
   const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [speedDemo, setSpeedDemo] = useState<AnalysisResponse | null>(null);
   const [speedDemoLoading, setSpeedDemoLoading] = useState(false);
@@ -237,8 +235,16 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<TabId>("simulation");
   const [demoMode, setDemoMode] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [savedIncidents, setSavedIncidents] = useState<SavedIncident[]>([]);
+  const [similarMatches, setSimilarMatches] = useState<ScoredIncident[]>([]);
+  const [priorsUsed, setPriorsUsed] = useState(false);
   const timerRef = useRef<number | null>(null);
   const timeoutsRef = useRef<number[]>([]);
+
+  // Hydrate incident memory from the browser on mount (SSR-safe — guarded inside the lib).
+  useEffect(() => {
+    setSavedIncidents(loadIncidents());
+  }, []);
 
   function clearTimers() {
     if (timerRef.current !== null) {
@@ -260,19 +266,16 @@ export default function Home() {
     setElapsedMs(0);
     setReportReady(false);
     setActiveTab("simulation");
+    setSimilarMatches([]);
+    setPriorsUsed(false);
     if (clearUploadedImage) setImage({ included: false });
   }
 
-  function selectDemo(id: string) {
-    const nextIncident = demoIncidents.find((demo) => demo.id === id);
-    if (!nextIncident) return;
-    resetInvestigationState(true);
-    setIncident(cloneIncident(nextIncident));
-  }
-
-  function generateIncident(machineType?: string) {
-    resetInvestigationState(true);
-    setIncident(generateSyntheticIncident(machineType));
+  function applySimulationEvidence(nextIncident: Incident) {
+    resetInvestigationState(false);
+    setError(null);
+    setIncident(nextIncident);
+    setHasEvidence(true);
   }
 
   function primeAgentMotion(startedAt: number) {
@@ -323,7 +326,7 @@ export default function Home() {
     timeoutsRef.current.push(doneTimeout);
   }
 
-  async function requestAnalysis(options: { includeGeminiComparison?: boolean } = {}) {
+  async function requestAnalysis(options: { includeGeminiComparison?: boolean; matches?: ScoredIncident[] } = {}) {
     const response = await fetch("/api/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -332,6 +335,8 @@ export default function Home() {
         imageDataUrl: image.included ? image.dataUrl : undefined,
         mode: demoMode ? "demo" : "live",
         includeGeminiComparison: options.includeGeminiComparison,
+        // Feed the most similar past incidents in as priors so the war room can recognise repeat failures.
+        priorIncidents: (options.matches ?? []).map(toPriorContext),
       }),
     });
 
@@ -362,9 +367,17 @@ export default function Home() {
     setActiveTab("agents");
     primeAgentMotion(startedAt);
 
+    // Retrieve similar past failures before the run so they can both inform the diagnosis and be shown.
+    const matches = findSimilarIncidents(incident, savedIncidents);
+    setSimilarMatches(matches);
+    setPriorsUsed(!demoMode && matches.length > 0);
+
     try {
-      const nextAnalysis = await requestAnalysis();
+      const nextAnalysis = await requestAnalysis({ matches });
       revealAnalysis(nextAnalysis, startedAt);
+      // Persist this investigation so it strengthens future pattern matching.
+      const { incidents: updated } = saveInvestigation(incident, nextAnalysis);
+      setSavedIncidents(updated);
     } catch (err) {
       // Fail honestly: never present fabricated results as a real diagnosis.
       clearTimers();
@@ -389,6 +402,19 @@ export default function Home() {
     } finally {
       setSpeedDemoLoading(false);
     }
+  }
+
+  function handleResolve(id: string, resolution: { confirmedRootCause: string; fix: string }) {
+    setSavedIncidents(recordResolution(id, resolution));
+  }
+  function handleClearResolution(id: string) {
+    setSavedIncidents(clearResolution(id));
+  }
+  function handleDeleteIncident(id: string) {
+    setSavedIncidents(deleteIncident(id));
+  }
+  function handleClearAllIncidents() {
+    setSavedIncidents(clearAllIncidents());
   }
 
   const result = analysis?.result;
@@ -419,6 +445,7 @@ export default function Home() {
     { id: "hypotheses", label: "Hypotheses", icon: <ListOrdered className="h-4 w-4" />, count: activeHypotheses.length || undefined },
     { id: "safety", label: "Safety", icon: <ShieldAlert className="h-4 w-4" />, count: activeSafetyWarnings.length || undefined },
     { id: "diagnostics", label: "Speed", icon: <Gauge className="h-4 w-4" /> },
+    { id: "history", label: "History", icon: <History className="h-4 w-4" />, count: savedIncidents.length || undefined },
   ];
 
   return (
@@ -460,7 +487,14 @@ export default function Home() {
               <span className={`h-1.5 w-1.5 rounded-full ${demoMode ? "bg-amber-500" : "bg-slate-300"}`} />
               Demo
             </button>
-            <Button type="button" variant="primary" size="lg" onClick={runInvestigation} disabled={loading}>
+            <Button
+              type="button"
+              variant="primary"
+              size="lg"
+              onClick={runInvestigation}
+              disabled={loading || !hasEvidence}
+              title={hasEvidence ? undefined : "Reproduce and capture a fault in the Simulation tab first."}
+            >
               {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
               {loading ? "Investigating..." : demoMode ? "Run demo" : "Run live"}
             </Button>
@@ -509,20 +543,7 @@ export default function Home() {
         </div>
       </section>
 
-      <div className="mx-auto grid max-w-[1680px] gap-5 px-4 pb-8 lg:grid-cols-[360px_minmax(0,1fr)] lg:px-8">
-        <aside className="min-w-0 lg:sticky lg:top-[82px] lg:max-h-[calc(100vh-98px)] lg:self-start lg:overflow-y-auto lg:pr-1 thin-scrollbar">
-          <IncidentInput
-            incident={incident}
-            setIncident={setIncident}
-            image={image}
-            onImageChange={setImage}
-            demoCases={demoIncidents}
-            onSelectDemo={selectDemo}
-            onGenerateSynthetic={generateIncident}
-            loading={loading}
-          />
-        </aside>
-
+      <div className="mx-auto max-w-[1680px] px-4 pb-8 lg:px-8">
         <section className="min-w-0 space-y-4">
           {error ? (
             <div className="flex animate-fade-in items-start justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3.5 text-sm text-red-900 shadow-card">
@@ -584,18 +605,40 @@ export default function Home() {
             {activeTab === "overview" ? (
               !hasRun ? (
                 <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
-                  <Panel title="Demo Runway" subtitle="Source evidence is loaded. Start the investigation when the room is watching." icon={<Play className="h-4 w-4" />} accent="brand">
+                  <Panel
+                    title={hasEvidence ? "Evidence captured" : "No evidence yet"}
+                    subtitle={hasEvidence ? "Twin evidence is loaded — run the investigation." : "The digital twin is the evidence source for this investigation."}
+                    icon={<Play className="h-4 w-4" />}
+                    accent="brand"
+                  >
                     <div className="grid gap-3 md:grid-cols-3">
-                      <StageLine icon={<FileText className="h-4 w-4" />} title="Evidence" caption={`${incident.logs.split("\n").filter(Boolean).length} log rows and field notes.`} active />
-                      <StageLine icon={<Cpu className="h-4 w-4" />} title="Twin" caption="MuJoCo model ready for live failure playback." active />
+                      <StageLine
+                        icon={<FileText className="h-4 w-4" />}
+                        title="Evidence"
+                        caption={hasEvidence ? `${incident.logs.split("\n").filter(Boolean).length} log rows captured from the twin.` : "Reproduce a fault and capture it in the Simulation tab."}
+                        active={hasEvidence}
+                      />
+                      <StageLine icon={<Cpu className="h-4 w-4" />} title="Twin" caption="MuJoCo UR5e cell with live failure injection." active />
                       <StageLine icon={<Bot className="h-4 w-4" />} title="Agents" caption="Specialists idle until you run the case." />
                     </div>
                     <div className="mt-5 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-4">
-                      <Button type="button" variant="primary" onClick={runInvestigation} disabled={loading}>
-                        <Play className="h-4 w-4" />
-                        Run investigation
-                      </Button>
-                      <span className="text-xs leading-5 text-slate-500">Current case: {incident.machineType}</span>
+                      {hasEvidence ? (
+                        <>
+                          <Button type="button" variant="primary" onClick={runInvestigation} disabled={loading}>
+                            <Play className="h-4 w-4" />
+                            Run investigation
+                          </Button>
+                          <span className="text-xs leading-5 text-slate-500">Captured case: {incident.machineType}</span>
+                        </>
+                      ) : (
+                        <>
+                          <Button type="button" variant="primary" onClick={() => setActiveTab("simulation")}>
+                            <Boxes className="h-4 w-4" />
+                            Go to the Simulation
+                          </Button>
+                          <span className="text-xs leading-5 text-slate-500">Reproduce a fault, then capture it to begin.</span>
+                        </>
+                      )}
                     </div>
                   </Panel>
 
@@ -634,12 +677,15 @@ export default function Home() {
                       <Kpi icon={<Zap className="h-4 w-4" />} label="Baseline delta" value={speedup ? `${speedup.toFixed(0)}x faster` : "-"} tone={speedup ? "good" : "default"} />
                     </div>
                   ) : null}
+                  {finalReport && similarMatches.length ? <SimilarIncidents matches={similarMatches} usedInDiagnosis={priorsUsed} /> : null}
                   <FinalReport report={finalReport} />
                 </>
               )
             ) : null}
 
-            {activeTab === "simulation" ? <MujocoSimulation /> : null}
+            {activeTab === "simulation" ? (
+              <MujocoSimulation incident={incident} onEvidenceChange={applySimulationEvidence} onRunInvestigation={runInvestigation} />
+            ) : null}
             {activeTab === "agents" ? <AgentWarRoom agents={agents} loading={loading} elapsedMs={elapsedMs} mode={analysis?.mode} /> : null}
             {activeTab === "timeline" ? <Timeline events={activeTimeline} /> : null}
             {activeTab === "evidence" ? <EvidenceGraph nodes={activeGraph.nodes} edges={activeGraph.edges} /> : null}
@@ -654,6 +700,15 @@ export default function Home() {
                 <SafetyWarningsPanel warnings={activeSafetyWarnings} />
                 <MissingDataPanel requests={activeMissingData} />
               </div>
+            ) : null}
+            {activeTab === "history" ? (
+              <HistoryPanel
+                incidents={savedIncidents}
+                onResolve={handleResolve}
+                onClearResolution={handleClearResolution}
+                onDelete={handleDeleteIncident}
+                onClearAll={handleClearAllIncidents}
+              />
             ) : null}
             {activeTab === "diagnostics" ? (
               <div className="space-y-5">

@@ -1,0 +1,7 @@
+# FactoryLens digital twin — Python simulation dependencies.
+# Headless rendering uses OSMesa (CPU); install the system lib with:
+#   apt-get install -y libosmesa6
+mujoco>=3.10
+numpy>=1.26
+Pillow>=10.0
+requests>=2.31

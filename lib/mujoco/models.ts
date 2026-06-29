@@ -1,346 +1,379 @@
 /**
  * MuJoCo model library for the in-browser Simulation tab.
  *
- * Each entry is a self-contained MJCF (MuJoCo XML) string plus the metadata the
- * UI needs to drive it: which `ctrl` channels to expose as sliders, which state
- * values to stream as live telemetry, and a set of *failure injections* that
- * mutate the loaded model in place to reproduce a degraded machine.
+ * One work-cell built around a REAL industrial robot from Google DeepMind's
+ * MuJoCo Menagerie (validated meshes, inertias, and tuned position actuators):
  *
- * The MJCF here is validated headlessly (npx tsx scripts/validate-mujoco.mts) —
- * it loads and steps without producing NaNs, and each failure produces a
- * visibly different steady state than the healthy machine.
+ *   • ur5e_cell — a Universal Robots UR5e running a scripted pick-and-place
+ *     cycle off a conveyor into a bin, next to a human keep-out zone. The cycle
+ *     and its faults are ported from the Python digital twin (twin/cell.py).
  *
- * MuJoCo geom type codes used by this WASM build:
- *   0 plane · 2 sphere · 3 capsule · 4 ellipsoid · 5 cylinder · 6 box · 7 mesh
+ * Mesh assets live under public/mujoco/models/<id>/ and are staged into the
+ * MuJoCo virtual FS at load time (see lib/mujoco/loader.ts → stageAndLoad).
+ *
+ * All geometry, the pick-and-place cycle, and every failure mode are validated
+ * headlessly (npx tsx scripts/validate-mujoco.mts).
  */
+import type { MjDataHandle, MjModelHandle, ModelAssets, MujocoModule } from "./loader";
 
-/** Minimal shape of the loaded model we mutate. Kept loose — the WASM typings
- *  declare these arrays `readonly`, but the underlying heap views are writable. */
-export interface MjModelLike {
-  nq: number;
-  nv: number;
-  nu: number;
-  dof_damping: Float64Array | number[];
-  dof_frictionloss: Float64Array | number[];
-  actuator_gainprm: Float64Array | number[];
-  actuator_biasprm: Float64Array | number[];
-  geom_friction: Float64Array | number[];
-}
-
-/** Stride of the per-actuator gain/bias parameter blocks (mjNGAIN / mjNBIAS). */
-const ACT_PRM_STRIDE = 10;
-
-/** Scale a position actuator's stiffness (kp) by `factor`, covering both the
- *  forward gain and the position-feedback bias term so the joint genuinely
- *  weakens rather than fighting itself. */
-function scaleActuatorGain(model: MjModelLike, actuatorIndex: number, factor: number) {
-  const g = actuatorIndex * ACT_PRM_STRIDE;
-  model.actuator_gainprm[g] *= factor; // kp
-  model.actuator_biasprm[g + 1] *= factor; // -kp position feedback
-}
-
-/** Override the sliding friction of a single geom (leaves torsional/rolling). */
-function setGeomSlideFriction(model: MjModelLike, geomIndex: number, value: number) {
-  model.geom_friction[geomIndex * 3] = value;
-}
+// ── Shared types ─────────────────────────────────────────────────────────────
 
 export interface ActuatorControl {
-  /** Indices into `data.ctrl` the slider drives. Usually one; a conveyor's
-   *  single "line speed" slider drives every roller actuator at once. */
-  indices: number[];
   label: string;
-  /** Units of the command (shown next to the slider). */
   unit: string;
   min: number;
   max: number;
   step: number;
   default: number;
+  /** Drive these `data.ctrl` channels directly (jog sliders). */
+  indices?: number[];
+  /** …or feed a controller parameter (e.g. belt speed) instead. */
+  param?: string;
 }
 
 export interface TelemetryChannel {
-  /** Where the value comes from. */
-  source: "qpos" | "qvel" | "actuator_force" | "time";
-  /** Index into the source array (ignored for `time`). */
-  index: number;
+  source: "qpos" | "qvel" | "actuator_force" | "site" | "controller";
+  /** Index into the source array, the site index, or unused for controller. */
+  index?: number;
+  /** Axis (0..2) for the `site` source. */
+  axis?: number;
+  /** Key for the `controller` source. */
+  key?: string;
   label: string;
   unit: string;
-  /** Multiply the raw value before display (e.g. rad → deg). */
   scale?: number;
-  /** Healthy operating band — values outside render as "out of spec". */
   nominal?: [number, number];
 }
 
 export interface FailureMode {
   id: string;
   label: string;
-  /** One line on the physical fault this reproduces. */
   description: string;
-  apply: (model: MjModelLike) => void;
+  /** Mutate the compiled model (rebuilds the sim on toggle). */
+  apply?: (model: MjModelHandle) => void;
+  /** …or set a flag the live controller reacts to (no rebuild). */
+  controllerFlag?: boolean;
+}
+
+export interface CellContext {
+  mod: MujocoModule;
+  model: MjModelHandle;
+  data: MjDataHandle;
+}
+
+/** A per-step controller for scripted cells (the UR5e pick-and-place cycle). */
+export interface SimController {
+  flags: Set<string>;
+  reset(ctx: CellContext): void;
+  /** Advance exactly one physics step (sets ctrl, moves the belt, steps, carries parts). */
+  step(ctx: CellContext): void;
+  setParam(key: string, value: number): void;
+  status(ctx: CellContext): { label: string; value: string; warn?: boolean }[];
+  telemetry(ctx: CellContext): Record<string, number>;
 }
 
 export interface SimModel {
   id: string;
   label: string;
-  /** Short noun phrase shown under the title. */
   tagline: string;
   description: string;
-  xml: string;
-  /** Physics steps to advance per rendered frame for ~real-time playback. */
+  robot: string;
+  assets: ModelAssets;
+  /** Joint configuration applied to the first qpos entries after reset. */
+  homeQpos: number[];
+  /** Physics steps per rendered frame for ~real-time playback. */
   realtimeSteps: number;
-  /** Optional starting joint configuration, applied after reset (e.g. to begin
-   *  with the gripper already clamped on the part). Length must equal model.nq. */
-  initialQpos?: number[];
   camera: { distance: number; azimuth: number; elevation: number; target: [number, number, number] };
   controls: ActuatorControl[];
   telemetry: TelemetryChannel[];
   failures: FailureMode[];
+  makeController?: () => SimController;
 }
 
-// ───────────────────────────── Articulated arm ─────────────────────────────
+/** Build an asset manifest mirroring public/mujoco/models/<dir> into the VFS. */
+function manifest(dir: string, xmls: string[], meshes: string[], rootXml: string): ModelAssets {
+  const url = `/mujoco/models/${dir}`;
+  const vfs = `/models/${dir}`;
+  return {
+    dirs: [vfs, `${vfs}/assets`],
+    files: [
+      ...xmls.map((f) => ({ path: `${vfs}/${f}`, url: `${url}/${f}`, binary: false })),
+      ...meshes.map((f) => ({ path: `${vfs}/assets/${f}`, url: `${url}/assets/${f}`, binary: true })),
+    ],
+    rootPath: `${vfs}/${rootXml}`,
+  };
+}
 
-const ARM_XML = `<mujoco model="arm">
-  <option gravity="0 0 -9.81" timestep="0.004" integrator="implicitfast"/>
-  <default>
-    <joint damping="2" armature="0.1"/>
-    <geom rgba="0.30 0.47 0.85 1"/>
-  </default>
-  <worldbody>
-    <geom name="floor" type="plane" size="3 3 0.1" rgba="0.86 0.88 0.92 1"/>
-    <body name="base" pos="0 0 0.08">
-      <geom name="g_base" type="cylinder" size="0.13 0.08" rgba="0.40 0.44 0.52 1"/>
-      <body name="link1" pos="0 0 0.08">
-        <joint name="shoulder" type="hinge" axis="0 1 0"/>
-        <geom name="g_l1" type="capsule" fromto="0 0 0 0 0 0.42" size="0.055"/>
-        <body name="link2" pos="0 0 0.42">
-          <joint name="elbow" type="hinge" axis="0 1 0"/>
-          <geom name="g_l2" type="capsule" fromto="0 0 0 0.42 0 0" size="0.05"/>
-          <body name="link3" pos="0.42 0 0">
-            <joint name="wrist" type="hinge" axis="0 1 0"/>
-            <geom name="g_l3" type="capsule" fromto="0 0 0 0.26 0 0" size="0.04"/>
-            <geom name="g_tool" type="box" pos="0.30 0 0" size="0.035 0.05 0.035" rgba="0.96 0.62 0.18 1"/>
-          </body>
-        </body>
-      </body>
-    </body>
-  </worldbody>
-  <actuator>
-    <position name="a_shoulder" joint="shoulder" kp="140" ctrlrange="-3.1 3.1"/>
-    <position name="a_elbow" joint="elbow" kp="100" ctrlrange="-2.6 2.6"/>
-    <position name="a_wrist" joint="wrist" kp="55" ctrlrange="-2.6 2.6"/>
-  </actuator>
-</mujoco>`;
+// ───────────────────────── UR5e pick-and-place cell ─────────────────────────
 
-const arm: SimModel = {
-  id: "arm",
-  label: "Articulated robot arm",
-  tagline: "3-DOF pick arm · position-controlled joints",
+const UR5E_MESHES = [
+  "base_0.obj", "base_1.obj", "shoulder_0.obj", "shoulder_1.obj", "shoulder_2.obj",
+  "upperarm_0.obj", "upperarm_1.obj", "upperarm_2.obj", "upperarm_3.obj",
+  "forearm_0.obj", "forearm_1.obj", "forearm_2.obj", "forearm_3.obj",
+  "wrist1_0.obj", "wrist1_1.obj", "wrist1_2.obj", "wrist2_0.obj", "wrist2_1.obj", "wrist2_2.obj",
+  "wrist3.obj",
+];
+
+// Cell geometry + cycle constants, mirrored from twin/cell.py.
+const PICK: [number, number, number] = [-0.447, 0.449, 0.085];
+const BIN: [number, number, number] = [-0.52, -0.365, 0.1];
+const SAFETY: [number, number, number] = [-0.52, -0.62, 0.13];
+const SAFETY_RADIUS = 0.15;
+const GRASP_OFFSET = -0.04; // held part rides just below the flange (z)
+const PHASE_SETPOINTS: Record<string, number[]> = {
+  home: [-1.57, -1.57, 1.57, -1.57, -1.57, 0],
+  reach: [-1.0, -1.0, 1.7, -2.2, -1.57, 0],
+  lift: [-1.0, -1.4, 1.5, -1.6, -1.57, 0],
+  transfer: [0.4, -1.4, 1.5, -1.6, -1.57, 0],
+  place: [0.4, -1.0, 1.7, -2.2, -1.57, 0],
+};
+const PHASE_ORDER = ["home", "reach", "lift", "transfer", "place"];
+const PHASE_DWELL = 1.0; // seconds per phase
+// Validated bias (joints 1-3) that drives the flange into the human keep-out zone.
+const OVERREACH_BIAS = [0.3, 0.2, -0.4, 0, 0, 0];
+
+// Seven parts queued along the belt; part2 and part5 are genuinely defective.
+const PART_COUNT = 7;
+const DEFECTIVE = new Set([2, 5]);
+const BELT_Y = 0.449;
+const PART_REST_Z = 0.085;
+const PART_SPACING = 0.12; // minimum gap maintained between queued parts
+// Starting positions on the belt (frontmost at the pick point); also the layout
+// the batch is recycled to once every part has been binned.
+const PART_START_X = [-0.447, -0.567, -0.687, -0.807, -0.927, -1.047, -1.167];
+const BATCH_RESET_DWELL = 1.5; // seconds to hold a finished batch before recycling
+
+/** Pick-and-place controller — a TypeScript port of twin/cell.py's scripted cycle,
+ *  extended to a seven-part queued batch that recycles for continuous running. */
+function makeCellController(): SimController {
+  let phaseIdx = 0;
+  let timer = 0;
+  let cycle = 0;
+  let batch = 0;
+  let resetTimer = 0;
+  let held: number | null = null;
+  let placed = new Set<number>();
+  let totalBinned = 0;
+  let defectsBinned = 0;
+  let elapsed = 0;
+  let siteId = 0;
+  let beltSpeed = 0.05;
+
+  const partQadr = (i: number) => 6 + 7 * i; // 6 arm joints, then freejoint parts
+  const partQvel = (i: number) => 6 + 6 * i;
+  const isWaiting = (i: number) => i !== held && !placed.has(i);
+
+  const flange = (d: MjDataHandle): [number, number, number] => [
+    d.site_xpos[siteId * 3],
+    d.site_xpos[siteId * 3 + 1],
+    d.site_xpos[siteId * 3 + 2],
+  ];
+
+  function spawnPart(d: MjDataHandle, i: number, x: number) {
+    const qa = partQadr(i);
+    d.qpos[qa] = x;
+    d.qpos[qa + 1] = BELT_Y;
+    d.qpos[qa + 2] = PART_REST_Z;
+    d.qpos[qa + 3] = 1;
+    d.qpos[qa + 4] = 0;
+    d.qpos[qa + 5] = 0;
+    d.qpos[qa + 6] = 0;
+    const dv = partQvel(i);
+    for (let k = 0; k < 6; k++) d.qvel[dv + k] = 0;
+  }
+
+  return {
+    flags: new Set<string>(),
+
+    reset(ctx) {
+      phaseIdx = 0;
+      timer = 0;
+      cycle = 0;
+      batch = 0;
+      resetTimer = 0;
+      held = null;
+      placed = new Set();
+      totalBinned = 0;
+      defectsBinned = 0;
+      elapsed = 0;
+      siteId = ctx.mod.mj_name2id(ctx.model, 6, "attachment_site");
+      if (siteId < 0) siteId = 0;
+    },
+
+    setParam(key, value) {
+      if (key === "belt") beltSpeed = value;
+    },
+
+    step(ctx) {
+      const { mod, model, data } = ctx;
+      const dt = model.opt.timestep;
+      elapsed += dt;
+      const phase = PHASE_ORDER[phaseIdx];
+      const set = PHASE_SETPOINTS[phase];
+      const overreach = this.flags.has("overreach") && (phase === "transfer" || phase === "place");
+      for (let k = 0; k < 6; k++) data.ctrl[k] = set[k] + (overreach ? OVERREACH_BIAS[k] : 0);
+
+      // Belt feed: each waiting part advances toward the pick point but keeps a
+      // minimum gap behind the part ahead of it, so they queue rather than stack.
+      const jammed = this.flags.has("belt-jam");
+      const effBelt = jammed ? 0 : beltSpeed;
+      if (effBelt > 0) {
+        for (let i = 0; i < PART_COUNT; i++) {
+          if (!isWaiting(i)) continue;
+          const qa = partQadr(i);
+          const x = data.qpos[qa];
+          const y = data.qpos[qa + 1];
+          const z = data.qpos[qa + 2];
+          if (Math.abs(y - BELT_Y) > 0.12 || z < 0.03 || x >= PICK[0] - 0.005) continue;
+          let aheadX = PICK[0] + PART_SPACING; // frontmost part may advance to the pick
+          for (let j = 0; j < PART_COUNT; j++) {
+            if (j === i || !isWaiting(j)) continue;
+            const xj = data.qpos[partQadr(j)];
+            if (xj > x && xj < aheadX) aheadX = xj;
+          }
+          const limit = Math.min(PICK[0], aheadX - PART_SPACING);
+          if (x < limit) data.qpos[qa] = Math.min(x + effBelt * dt, limit);
+        }
+      }
+
+      mod.mj_step(model, data);
+
+      // Carry the grasped part kinematically along with the flange.
+      if (held !== null) {
+        const f = flange(data);
+        const qa = partQadr(held);
+        data.qpos[qa] = f[0];
+        data.qpos[qa + 1] = f[1];
+        data.qpos[qa + 2] = f[2] + GRASP_OFFSET;
+        data.qpos[qa + 3] = 1;
+        data.qpos[qa + 4] = 0;
+        data.qpos[qa + 5] = 0;
+        data.qpos[qa + 6] = 0;
+        const dv = partQvel(held);
+        for (let k = 0; k < 6; k++) data.qvel[dv + k] = 0;
+      }
+
+      // Once the whole batch is binned, hold briefly then recycle a fresh batch.
+      if (placed.size >= PART_COUNT) {
+        resetTimer += dt;
+        if (resetTimer >= BATCH_RESET_DWELL) {
+          for (let i = 0; i < PART_COUNT; i++) spawnPart(data, i, PART_START_X[i]);
+          placed = new Set();
+          held = null;
+          resetTimer = 0;
+          batch++;
+        }
+      }
+
+      timer += dt;
+      if (timer >= PHASE_DWELL) {
+        timer = 0;
+        if (phase === "reach" && held === null && !this.flags.has("grasp-slip")) {
+          let best: number | null = null;
+          let bestD = 0.12;
+          for (let i = 0; i < PART_COUNT; i++) {
+            if (placed.has(i)) continue;
+            const qa = partQadr(i);
+            const dd = Math.hypot(data.qpos[qa] - PICK[0], data.qpos[qa + 1] - PICK[1]);
+            if (dd < bestD) {
+              best = i;
+              bestD = dd;
+            }
+          }
+          if (best !== null) held = best;
+        } else if (phase === "place" && held !== null) {
+          placed.add(held);
+          totalBinned++;
+          if (DEFECTIVE.has(held)) defectsBinned++;
+          held = null;
+        }
+        phaseIdx++;
+        if (phaseIdx >= PHASE_ORDER.length) {
+          phaseIdx = 0;
+          cycle++;
+        }
+      }
+    },
+
+    status(ctx) {
+      const f = flange(ctx.data);
+      const dSafe = Math.hypot(f[0] - SAFETY[0], f[1] - SAFETY[1]);
+      return [
+        { label: "Phase", value: PHASE_ORDER[phaseIdx] },
+        { label: "Batch", value: String(batch + 1) },
+        { label: "Holding", value: held === null ? "—" : `part ${held}` },
+        { label: "Safety", value: dSafe < SAFETY_RADIUS ? "BREACH" : "clear", warn: dSafe < SAFETY_RADIUS },
+      ];
+    },
+
+    telemetry(ctx) {
+      const f = flange(ctx.data);
+      const dSafe = Math.hypot(f[0] - SAFETY[0], f[1] - SAFETY[1]);
+      const jammed = this.flags.has("belt-jam");
+      let onBelt = 0;
+      for (let i = 0; i < PART_COUNT; i++) if (isWaiting(i)) onBelt++;
+      return {
+        safety_dist: dSafe,
+        belt_speed: jammed ? 0 : beltSpeed,
+        belt_current: jammed ? 5.2 : 1.8 + beltSpeed * 4, // drive current spikes on a jam
+        binned: placed.size, // currently sitting in the bin (this batch)
+        total_picked: totalBinned, // cumulative across batches
+        defects: defectsBinned, // defective parts handled
+        on_belt: onBelt, // parts still queued on the conveyor
+        throughput: elapsed > 1 ? (totalBinned / elapsed) * 60 : 0, // parts / minute
+      };
+    },
+  };
+}
+
+const ur5eCell: SimModel = {
+  id: "ur5e_cell",
+  label: "UR5e pick-and-place cell",
+  tagline: "UR5e · 7-part queue → bin · human keep-out zone",
   description:
-    "A three-joint articulated arm holding a commanded pose against gravity. Each joint is a closed-loop position actuator, so you can watch the controller fight back — and watch it lose when a joint degrades.",
-  xml: ARM_XML,
-  realtimeSteps: 4,
-  camera: { distance: 2.0, azimuth: 1.05, elevation: 0.35, target: [0.25, 0, 0.55] },
+    "A Universal Robots UR5e running a continuous pick-and-place line: index parts off a conveyor queue and drop them in the bin, beside a human safety keep-out zone. Seven parts (two defective) feed in sequence and recycle as a fresh batch, so the line runs indefinitely. The arm dynamics are the manufacturer-validated MuJoCo model; the cycle is the same scripted trajectory as the digital twin. Inject a fault and watch throughput collapse or the gripper breach the safety zone.",
+  robot: "Universal Robots UR5e",
+  assets: manifest("ur5e", ["factory_cell_xl.xml", "ur5e.xml"], UR5E_MESHES, "factory_cell_xl.xml"),
+  homeQpos: [-1.57, -1.57, 1.57, -1.57, -1.57, 0], // arm joints only; parts keep their belt poses
+  realtimeSteps: 8,
+  camera: { distance: 2.6, azimuth: -0.9, elevation: 0.45, target: [-0.5, 0.05, 0.3] },
   controls: [
-    { indices: [0], label: "Shoulder target", unit: "rad", min: -1.6, max: 1.6, step: 0.01, default: 0.4 },
-    { indices: [1], label: "Elbow target", unit: "rad", min: -2.4, max: 0.2, step: 0.01, default: -1.0 },
-    { indices: [2], label: "Wrist target", unit: "rad", min: -1.8, max: 1.8, step: 0.01, default: 0.6 },
+    { param: "belt", label: "Belt speed", unit: "m/s", min: 0, max: 0.1, step: 0.005, default: 0.05 },
   ],
   telemetry: [
-    { source: "qpos", index: 0, label: "Shoulder angle", unit: "°", scale: 180 / Math.PI },
-    { source: "qpos", index: 1, label: "Elbow angle", unit: "°", scale: 180 / Math.PI },
-    { source: "qpos", index: 2, label: "Wrist angle", unit: "°", scale: 180 / Math.PI },
-    { source: "actuator_force", index: 0, label: "Shoulder torque", unit: "N·m", nominal: [-40, 40] },
-    { source: "actuator_force", index: 1, label: "Elbow torque", unit: "N·m", nominal: [-40, 40] },
-    { source: "qvel", index: 2, label: "Wrist rate", unit: "rad/s", nominal: [-2, 2] },
+    { source: "controller", key: "safety_dist", label: "Gripper → human zone", unit: "m", nominal: [SAFETY_RADIUS, 99] },
+    { source: "controller", key: "belt_current", label: "Conveyor drive current", unit: "A", nominal: [0, 3] },
+    { source: "controller", key: "throughput", label: "Throughput", unit: "/min" },
+    { source: "controller", key: "total_picked", label: "Parts processed", unit: "" },
+    { source: "controller", key: "on_belt", label: "Parts on belt", unit: "" },
+    { source: "controller", key: "defects", label: "Defective handled", unit: "" },
+    { source: "actuator_force", index: 1, label: "Shoulder-lift torque", unit: "N·m", nominal: [-120, 120] },
   ],
   failures: [
     {
-      id: "elbow-gain-loss",
-      label: "Elbow actuator gain loss",
-      description: "Drive amplifier degraded — elbow stiffness drops ~85%, so the arm sags below its commanded pose.",
-      apply: (m) => scaleActuatorGain(m, 1, 0.15),
+      id: "belt-jam",
+      label: "Conveyor jam",
+      description: "The belt seizes — parts stop indexing to the pick point and drive current spikes. Throughput collapses after the part already at the pick.",
+      controllerFlag: true,
     },
     {
-      id: "shoulder-friction",
-      label: "Shoulder bearing friction spike",
-      description: "Contaminated shoulder bearing adds dry friction, so the joint stalls short of its target.",
-      apply: (m) => {
-        m.dof_frictionloss[0] = 22;
-      },
+      id: "grasp-slip",
+      label: "Grasp failure",
+      description: "The gripper fails to close on the part — the arm runs the full cycle but picks nothing, leaving parts stranded on the belt.",
+      controllerFlag: true,
     },
     {
-      id: "wrist-damping-loss",
-      label: "Wrist damping loss",
-      description: "Worn wrist damper — the joint loses damping and oscillates around its setpoint.",
-      apply: (m) => {
-        m.dof_damping[2] = 0;
-      },
+      id: "overreach",
+      label: "Collision-risk overreach",
+      description: "A miscalibrated place pose swings the flange into the human keep-out zone — the safety distance drops below its limit.",
+      controllerFlag: true,
     },
   ],
+  makeController: makeCellController,
 };
 
-// ──────────────────────────── Conveyor / belt ──────────────────────────────
-// A roller-bed conveyor: six driven rollers, with the crate riding directly on
-// top of them. Transport happens purely through roller→crate friction, so a
-// friction or drive fault strands the crate — the way a real jam reads.
-
-const CONVEYOR_XML = `<mujoco model="conveyor">
-  <option gravity="0 0 -9.81" timestep="0.004"/>
-  <default>
-    <geom friction="2.0 0.05 0.001"/>
-    <joint damping="0.3"/>
-  </default>
-  <worldbody>
-    <geom name="floor" type="plane" size="4 4 0.1" rgba="0.86 0.88 0.92 1"/>
-    <geom name="wall_l" type="box" pos="0 0.30 0.34" size="0.85 0.02 0.05" rgba="0.40 0.43 0.50 1"/>
-    <geom name="wall_r" type="box" pos="0 -0.30 0.34" size="0.85 0.02 0.05" rgba="0.40 0.43 0.50 1"/>
-    <body name="roller0" pos="-0.72 0 0.30" euler="90 0 0"><joint name="r0" type="hinge" axis="0 0 1"/><geom name="g_r0" type="cylinder" size="0.07 0.27" rgba="0.45 0.49 0.58 1"/></body>
-    <body name="roller1" pos="-0.54 0 0.30" euler="90 0 0"><joint name="r1" type="hinge" axis="0 0 1"/><geom name="g_r1" type="cylinder" size="0.07 0.27" rgba="0.45 0.49 0.58 1"/></body>
-    <body name="roller2" pos="-0.36 0 0.30" euler="90 0 0"><joint name="r2" type="hinge" axis="0 0 1"/><geom name="g_r2" type="cylinder" size="0.07 0.27" rgba="0.45 0.49 0.58 1"/></body>
-    <body name="roller3" pos="-0.18 0 0.30" euler="90 0 0"><joint name="r3" type="hinge" axis="0 0 1"/><geom name="g_r3" type="cylinder" size="0.07 0.27" rgba="0.45 0.49 0.58 1"/></body>
-    <body name="roller4" pos="0 0 0.30" euler="90 0 0"><joint name="r4" type="hinge" axis="0 0 1"/><geom name="g_r4" type="cylinder" size="0.07 0.27" rgba="0.45 0.49 0.58 1"/></body>
-    <body name="roller5" pos="0.18 0 0.30" euler="90 0 0"><joint name="r5" type="hinge" axis="0 0 1"/><geom name="g_r5" type="cylinder" size="0.07 0.27" rgba="0.45 0.49 0.58 1"/></body>
-    <body name="roller6" pos="0.36 0 0.30" euler="90 0 0"><joint name="r6" type="hinge" axis="0 0 1"/><geom name="g_r6" type="cylinder" size="0.07 0.27" rgba="0.45 0.49 0.58 1"/></body>
-    <body name="roller7" pos="0.54 0 0.30" euler="90 0 0"><joint name="r7" type="hinge" axis="0 0 1"/><geom name="g_r7" type="cylinder" size="0.07 0.27" rgba="0.45 0.49 0.58 1"/></body>
-    <body name="roller8" pos="0.72 0 0.30" euler="90 0 0"><joint name="r8" type="hinge" axis="0 0 1"/><geom name="g_r8" type="cylinder" size="0.07 0.27" rgba="0.45 0.49 0.58 1"/></body>
-    <body name="crate" pos="0.65 0 0.51">
-      <freejoint/>
-      <geom name="g_crate" type="box" size="0.12 0.12 0.12" rgba="0.96 0.62 0.18 1" mass="0.5"/>
-    </body>
-  </worldbody>
-  <actuator>
-    <velocity name="a_r0" joint="r0" kv="3" ctrlrange="-30 30"/>
-    <velocity name="a_r1" joint="r1" kv="3" ctrlrange="-30 30"/>
-    <velocity name="a_r2" joint="r2" kv="3" ctrlrange="-30 30"/>
-    <velocity name="a_r3" joint="r3" kv="3" ctrlrange="-30 30"/>
-    <velocity name="a_r4" joint="r4" kv="3" ctrlrange="-30 30"/>
-    <velocity name="a_r5" joint="r5" kv="3" ctrlrange="-30 30"/>
-    <velocity name="a_r6" joint="r6" kv="3" ctrlrange="-30 30"/>
-    <velocity name="a_r7" joint="r7" kv="3" ctrlrange="-30 30"/>
-    <velocity name="a_r8" joint="r8" kv="3" ctrlrange="-30 30"/>
-  </actuator>
-</mujoco>`;
-
-const conveyor: SimModel = {
-  id: "conveyor",
-  label: "Conveyor / belt drive",
-  tagline: "9 driven rollers · friction-coupled crate",
-  description:
-    "Nine motorized rollers carry a crate along a guided bed. The crate is driven purely by friction with the rollers, so a contamination or drive-line fault leaves it stranded — exactly how a jam reads on the floor.",
-  xml: CONVEYOR_XML,
-  realtimeSteps: 4,
-  camera: { distance: 3.2, azimuth: 0.9, elevation: 0.42, target: [0, 0, 0.32] },
-  controls: [
-    // One "line speed" slider drives all nine roller actuators together; the
-    // crate enters at +X and is carried toward −X across the bed.
-    { indices: [0, 1, 2, 3, 4, 5, 6, 7, 8], label: "Line speed", unit: "rad/s", min: 0, max: 18, step: 0.5, default: 9 },
-  ],
-  telemetry: [
-    { source: "qpos", index: 9, label: "Crate position X", unit: "m", nominal: [-0.8, 0.8] },
-    { source: "qvel", index: 0, label: "Roller rate", unit: "rad/s" },
-    { source: "actuator_force", index: 0, label: "Drive torque", unit: "N·m", nominal: [-40, 40] },
-  ],
-  failures: [
-    {
-      id: "belt-slip",
-      label: "Roller surface contamination",
-      description: "Oil on the rollers collapses surface friction — the rollers keep spinning but the crate barely advances.",
-      apply: (m) => {
-        // geom order: floor(0) wall_l(1) wall_r(2) r0..r8(3..11) crate(12)
-        for (let g = 3; g <= 11; g++) setGeomSlideFriction(m, g, 0.03);
-        setGeomSlideFriction(m, 12, 0.03);
-      },
-    },
-    {
-      id: "driveline-seizure",
-      label: "Drive-line bearing seizure",
-      description: "Roller bearings seize with heavy dry friction — drive torque saturates and transport stalls.",
-      apply: (m) => {
-        for (let dof = 0; dof <= 8; dof++) m.dof_frictionloss[dof] = 30;
-      },
-    },
-  ],
-};
-
-// ─────────────────────────── Gripper / pick ────────────────────────────────
-// Starts already clamped on the part (see initialQpos) so the grasp is the
-// steady state. Healthy grip holds the part by friction; a force or friction
-// fault lets it slip out of the jaws and fall.
-
-const GRIPPER_XML = `<mujoco model="gripper">
-  <option gravity="0 0 -9.81" timestep="0.004"/>
-  <default>
-    <geom friction="1.6 0.1 0.002"/>
-  </default>
-  <worldbody>
-    <geom name="floor" type="plane" size="2 2 0.1" rgba="0.86 0.88 0.92 1"/>
-    <body name="palm" pos="0 0 0.50">
-      <geom name="g_palm" type="box" size="0.13 0.05 0.025" rgba="0.40 0.44 0.52 1"/>
-      <body name="finger_l" pos="0.10 0 -0.02">
-        <joint name="fl" type="slide" axis="-1 0 0" range="0 0.075" damping="6"/>
-        <geom name="g_fl" type="box" size="0.014 0.04 0.12" pos="0 0 -0.13" rgba="0.30 0.47 0.85 1"/>
-      </body>
-      <body name="finger_r" pos="-0.10 0 -0.02">
-        <joint name="fr" type="slide" axis="1 0 0" range="0 0.075" damping="6"/>
-        <geom name="g_fr" type="box" size="0.014 0.04 0.12" pos="0 0 -0.13" rgba="0.30 0.47 0.85 1"/>
-      </body>
-    </body>
-    <body name="part" pos="0 0 0.34">
-      <freejoint/>
-      <geom name="g_part" type="box" size="0.045 0.05 0.07" rgba="0.96 0.62 0.18 1" mass="0.4"/>
-    </body>
-  </worldbody>
-  <actuator>
-    <position name="a_fl" joint="fl" kp="200" ctrlrange="0 0.075"/>
-    <position name="a_fr" joint="fr" kp="200" ctrlrange="0 0.075"/>
-  </actuator>
-</mujoco>`;
-
-const gripper: SimModel = {
-  id: "gripper",
-  label: "Gripper / pick-and-place",
-  tagline: "Two-finger pinch · friction grasp",
-  description:
-    "A parallel-jaw gripper holds a part against gravity by friction alone — it starts already clamped. Keep the jaws closed and it holds; lose grip force or pad friction and the part slips out of the jaws and drops.",
-  xml: GRIPPER_XML,
-  realtimeSteps: 4,
-  // [fl, fr, part x, y, z, quat w x y z] — jaws clamped, part centered at grip height.
-  initialQpos: [0.055, 0.055, 0, 0, 0.34, 1, 0, 0, 0],
-  camera: { distance: 1.5, azimuth: 0.8, elevation: 0.28, target: [0, 0, 0.4] },
-  controls: [
-    { indices: [0], label: "Left jaw close", unit: "m", min: 0, max: 0.075, step: 0.001, default: 0.055 },
-    { indices: [1], label: "Right jaw close", unit: "m", min: 0, max: 0.075, step: 0.001, default: 0.055 },
-  ],
-  telemetry: [
-    { source: "qpos", index: 4, label: "Part height Z", unit: "m", nominal: [0.3, 0.4] },
-    { source: "actuator_force", index: 0, label: "Grip force (L)", unit: "N", nominal: [2, 60] },
-    { source: "actuator_force", index: 1, label: "Grip force (R)", unit: "N", nominal: [2, 60] },
-  ],
-  failures: [
-    {
-      id: "grip-gain-loss",
-      label: "Grip actuator gain loss",
-      description: "Pneumatic pressure drop weakens both jaws ~80% — clamp force can no longer hold the part.",
-      apply: (m) => {
-        scaleActuatorGain(m, 0, 0.2);
-        scaleActuatorGain(m, 1, 0.2);
-      },
-    },
-    {
-      id: "pad-contamination",
-      label: "Jaw pad contamination",
-      description: "Lubricant on the gripper pads collapses contact friction, so the part slips out of the closed jaws.",
-      apply: (m) => {
-        // geom order: floor(0) palm(1) fl(2) fr(3) part(4)
-        setGeomSlideFriction(m, 2, 0.05);
-        setGeomSlideFriction(m, 3, 0.05);
-        setGeomSlideFriction(m, 4, 0.05);
-      },
-    },
-  ],
-};
-
-export const SIM_MODELS: SimModel[] = [arm, conveyor, gripper];
+export const SIM_MODELS: SimModel[] = [ur5eCell];
 
 export function getModel(id: string): SimModel {
-  return SIM_MODELS.find((m) => m.id === id) ?? arm;
+  return SIM_MODELS.find((m) => m.id === id) ?? ur5eCell;
 }

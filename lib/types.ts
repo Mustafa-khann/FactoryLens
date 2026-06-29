@@ -94,7 +94,7 @@ export interface SkepticReview {
   revisedConfidenceLevel: "low" | "medium" | "high";
 }
 
-/** Telemetry that makes Cerebras speed concrete: how many Gemma 4 calls, how fast, vs a GPU baseline. */
+/** Telemetry for model calls, latency, throughput, and comparison baselines. */
 export interface PipelineTelemetry {
   provider: ModelProvider;
   providerLabel: string;
@@ -166,6 +166,18 @@ export interface InvestigationResult {
   discordSubmission: string;
   visionObservations?: VisionObservations;
   skepticReview?: SkepticReview;
+}
+
+/** A compact prior drawn from incident memory and fed into the live pipeline so it can recognise repeat failures. */
+export interface PriorIncidentContext {
+  title: string;
+  machineType: string;
+  severity: IncidentSeverity;
+  diagnosedRootCause: string;
+  /** The confirmed root cause once a human recorded the real resolution (high-signal). */
+  confirmedRootCause?: string;
+  /** What actually fixed the past incident. */
+  resolvedFix?: string;
 }
 
 export interface AnalysisUsage {
