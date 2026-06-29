@@ -7,6 +7,7 @@ import {
   Database,
   Gauge,
   HelpCircle,
+  History,
   LayoutDashboard,
   ListOrdered,
   Play,
@@ -22,17 +23,31 @@ import { Button } from "@/components/ui/Button";
 import { AgentWarRoom } from "@/components/AgentWarRoom";
 import { EvidenceGraph } from "@/components/EvidenceGraph";
 import { FinalReport } from "@/components/FinalReport";
+import { HistoryPanel } from "@/components/HistoryPanel";
 import { HypothesisBattle } from "@/components/HypothesisBattle";
 import { ImageEvidencePanel } from "@/components/ImageEvidencePanel";
 import { IncidentInput } from "@/components/IncidentInput";
+import { SimilarIncidents } from "@/components/SimilarIncidents";
 import { SpeedPanel } from "@/components/SpeedPanel";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Timeline } from "@/components/Timeline";
 import { AGENT_PROFILES, createEmptyAgents } from "@/lib/agents";
+import {
+  clearAllIncidents,
+  clearResolution,
+  deleteIncident,
+  findSimilarIncidents,
+  loadIncidents,
+  recordResolution,
+  saveInvestigation,
+  toPriorContext,
+  type SavedIncident,
+  type ScoredIncident,
+} from "@/lib/incidentMemory";
 import { demoIncidents, generateSyntheticIncident } from "@/lib/simulatedIncidents";
 import type { AgentDisplay, AnalysisResponse, ImageEvidenceMeta, Incident, MissingDataRequest, SafetyWarning } from "@/lib/types";
 
-type TabId = "overview" | "agents" | "timeline" | "evidence" | "hypotheses" | "safety" | "diagnostics";
+type TabId = "overview" | "agents" | "timeline" | "evidence" | "hypotheses" | "safety" | "history" | "diagnostics";
 
 function cloneIncident(incident: Incident): Incident {
   return {
@@ -142,8 +157,16 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<TabId>("overview");
   const [demoMode, setDemoMode] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [savedIncidents, setSavedIncidents] = useState<SavedIncident[]>([]);
+  const [similarMatches, setSimilarMatches] = useState<ScoredIncident[]>([]);
+  const [priorsUsed, setPriorsUsed] = useState(false);
   const timerRef = useRef<number | null>(null);
   const timeoutsRef = useRef<number[]>([]);
+
+  // Hydrate incident memory from the browser on mount (SSR-safe — guarded inside the lib).
+  useEffect(() => {
+    setSavedIncidents(loadIncidents());
+  }, []);
 
   function clearTimers() {
     if (timerRef.current !== null) {
@@ -165,6 +188,8 @@ export default function Home() {
     setElapsedMs(0);
     setReportReady(false);
     setActiveTab("overview");
+    setSimilarMatches([]);
+    setPriorsUsed(false);
     if (clearUploadedImage) setImage({ included: false });
   }
 
@@ -228,7 +253,7 @@ export default function Home() {
     timeoutsRef.current.push(doneTimeout);
   }
 
-  async function requestAnalysis() {
+  async function requestAnalysis(matches: ScoredIncident[] = []) {
     const response = await fetch("/api/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -236,6 +261,8 @@ export default function Home() {
         incident,
         imageDataUrl: image.included ? image.dataUrl : undefined,
         mode: demoMode ? "demo" : "live",
+        // Feed the most similar past incidents in as priors so the war room can recognise repeat failures.
+        priorIncidents: matches.map(toPriorContext),
       }),
     });
 
@@ -266,9 +293,17 @@ export default function Home() {
     setActiveTab("agents");
     primeAgentMotion(startedAt);
 
+    // Retrieve similar past failures before the run so they can both inform the diagnosis and be shown.
+    const matches = findSimilarIncidents(incident, savedIncidents);
+    setSimilarMatches(matches);
+    setPriorsUsed(!demoMode && matches.length > 0);
+
     try {
-      const nextAnalysis = await requestAnalysis();
+      const nextAnalysis = await requestAnalysis(matches);
       revealAnalysis(nextAnalysis, startedAt);
+      // Persist this investigation so it strengthens future pattern matching.
+      const { incidents: updated } = saveInvestigation(incident, nextAnalysis);
+      setSavedIncidents(updated);
     } catch (err) {
       // Fail honestly — never present fabricated results as a real diagnosis.
       clearTimers();
@@ -295,6 +330,19 @@ export default function Home() {
     }
   }
 
+  function handleResolve(id: string, resolution: { confirmedRootCause: string; fix: string }) {
+    setSavedIncidents(recordResolution(id, resolution));
+  }
+  function handleClearResolution(id: string) {
+    setSavedIncidents(clearResolution(id));
+  }
+  function handleDeleteIncident(id: string) {
+    setSavedIncidents(deleteIncident(id));
+  }
+  function handleClearAllIncidents() {
+    setSavedIncidents(clearAllIncidents());
+  }
+
   const result = analysis?.result;
   const activeTimeline = result?.timeline ?? [];
   const activeGraph = result?.evidenceGraph ?? { nodes: [], edges: [] };
@@ -316,6 +364,7 @@ export default function Home() {
     { id: "evidence", label: "Evidence", icon: <Share2 className="h-4 w-4" />, count: activeGraph.nodes.length || undefined },
     { id: "hypotheses", label: "Hypotheses", icon: <ListOrdered className="h-4 w-4" />, count: activeHypotheses.length || undefined },
     { id: "safety", label: "Safety & Gaps", icon: <ShieldAlert className="h-4 w-4" />, count: activeSafetyWarnings.length || undefined },
+    { id: "history", label: "History", icon: <History className="h-4 w-4" />, count: savedIncidents.length || undefined },
     { id: "diagnostics", label: "Diagnostics", icon: <Gauge className="h-4 w-4" /> },
   ];
 
@@ -486,6 +535,7 @@ export default function Home() {
                       <Kpi label="vs GPU baseline" value={speedup ? `≈${speedup.toFixed(0)}× faster` : "—"} tone={speedup ? "good" : "default"} />
                     </div>
                   ) : null}
+                  {finalReport && similarMatches.length ? <SimilarIncidents matches={similarMatches} usedInDiagnosis={priorsUsed} /> : null}
                   <FinalReport report={finalReport} />
                 </>
               )
@@ -500,6 +550,15 @@ export default function Home() {
                 <SafetyWarningsPanel warnings={activeSafetyWarnings} />
                 <MissingDataPanel requests={activeMissingData} />
               </>
+            ) : null}
+            {activeTab === "history" ? (
+              <HistoryPanel
+                incidents={savedIncidents}
+                onResolve={handleResolve}
+                onClearResolution={handleClearResolution}
+                onDelete={handleDeleteIncident}
+                onClearAll={handleClearAllIncidents}
+              />
             ) : null}
             {activeTab === "diagnostics" ? (
               <>

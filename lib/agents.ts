@@ -1,5 +1,5 @@
 import type { ChatMessage } from "./cerebras";
-import type { AgentDisplay, AgentProfile, Incident } from "./types";
+import type { AgentDisplay, AgentProfile, Incident, PriorIncidentContext } from "./types";
 
 export const AGENT_PROFILES: AgentProfile[] = [
   {
@@ -53,7 +53,38 @@ export function createEmptyAgents(): AgentDisplay[] {
   }));
 }
 
-function formatIncidentEvidence(incident: Incident, imageDataUrl?: string, visionFindings?: string[]) {
+/** Render past similar incidents as priors the agents may use, while making clear current evidence overrides them. */
+function formatPriorIncidents(priorIncidents?: PriorIncidentContext[]): string {
+  if (!priorIncidents || priorIncidents.length === 0) {
+    return [
+      "Site incident history:",
+      "No similar past incidents are on record for this machine. Treat this as a first-occurrence pattern.",
+    ].join("\n");
+  }
+  const lines = priorIncidents.map((prior, index) => {
+    const confirmed = prior.confirmedRootCause
+      ? ` CONFIRMED root cause (resolved by a technician): ${prior.confirmedRootCause}.`
+      : "";
+    const fix = prior.resolvedFix ? ` Fix that worked: ${prior.resolvedFix}.` : "";
+    return `${index + 1}. "${prior.title}" on a ${prior.machineType} (severity ${prior.severity}). Previously diagnosed as: ${prior.diagnosedRootCause}.${confirmed}${fix}`;
+  });
+  return [
+    "Site incident history (similar past failures retrieved from FactoryLens memory):",
+    ...lines,
+    "",
+    "How to use this history:",
+    "- Treat these as PRIORS, not ground truth. The current evidence always overrides them.",
+    "- If a prior with a CONFIRMED resolution closely matches the current evidence, surface it as a leading hypothesis and reference it, but still demand the confirming test before recommending the same fix.",
+    "- If the current evidence contradicts the priors, say so explicitly rather than forcing a match.",
+  ].join("\n");
+}
+
+function formatIncidentEvidence(
+  incident: Incident,
+  imageDataUrl?: string,
+  visionFindings?: string[],
+  priorIncidents?: PriorIncidentContext[],
+) {
   return [
     "Run a full FactoryLens multi-agent investigation.",
     "",
@@ -62,6 +93,8 @@ function formatIncidentEvidence(incident: Incident, imageDataUrl?: string, visio
     "",
     "Synthetic data note:",
     "These are synthetic industrial incidents modeled after real robotics, PLC, and field-maintenance failure patterns.",
+    "",
+    formatPriorIncidents(priorIncidents),
     "",
     "Hard rules:",
     "- Be technical and concise.",
@@ -118,13 +151,18 @@ function formatIncidentEvidence(incident: Incident, imageDataUrl?: string, visio
   ].join("\n");
 }
 
-export function buildFullInvestigationMessages(incident: Incident, imageDataUrl?: string, visionFindings?: string[]): ChatMessage[] {
+export function buildFullInvestigationMessages(
+  incident: Incident,
+  imageDataUrl?: string,
+  visionFindings?: string[],
+  priorIncidents?: PriorIncidentContext[],
+): ChatMessage[] {
   const userContent: ChatMessage["content"] = imageDataUrl
     ? [
-        { type: "text", text: formatIncidentEvidence(incident, imageDataUrl, visionFindings) },
+        { type: "text", text: formatIncidentEvidence(incident, imageDataUrl, visionFindings, priorIncidents) },
         { type: "image_url", image_url: { url: imageDataUrl } },
       ]
-    : formatIncidentEvidence(incident, undefined, visionFindings);
+    : formatIncidentEvidence(incident, undefined, visionFindings, priorIncidents);
 
   return [
     {

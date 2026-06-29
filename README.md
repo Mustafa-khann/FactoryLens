@@ -42,6 +42,17 @@ The **Skeptic round visibly changes the output** — leading-hypothesis confiden
 - **Speed in action** — every run reports Gemma 4 call count, throughput (tok/s), wall time, and a side-by-side latency comparison vs an estimated GPU baseline.
 - **Enterprise impact** — incident response is a first-class enterprise use case; the tool is production-shaped: honest failure modes, calibrated confidence, no unsafe repair steps, deployable on Vercel.
 
+## Incident memory — it gets smarter the more you use it
+
+A one-shot diagnosis is a demo. A tool a maintenance team actually relies on **remembers**. FactoryLens keeps a local **incident memory**: every completed investigation is saved in the browser, and when a new incident comes in it retrieves the most similar past failures — surfacing them in a **"Seen before"** card and feeding them into the live pipeline as priors.
+
+- **Pattern recognition** — a lightweight, domain-aware similarity engine matches on machine type, severity, and shared signals (alarm codes, part numbers, symptom keywords), so a repeat of last month's servo overheat is recognised instantly.
+- **Closing the loop** — a tech records how an incident was *actually* resolved in the **History** tab. Confirmed resolutions are the highest-signal priors: the next matching incident gets "previously confirmed as X, fixed by Y" fed straight to the agents.
+- **Priors, not ground truth** — retrieved history is passed to the war room as a prior the current evidence can override; the model is instructed to demand confirming evidence before repeating a past fix, never to force a match.
+- **No backend required** — memory lives in `localStorage`, so the whole loop stays Vercel-deployable and private to the operator's machine.
+
+This turns FactoryLens from a stateless single-shot into a tool whose value compounds with every incident a site works through.
+
 ## Honest by design
 
 FactoryLens **never fabricates a diagnosis**. If the live model is unavailable, it fails with a clear message — it does not silently invent results. **Demo mode** is an explicit, clearly-labeled toggle that runs on built-in sample incidents so you can explore the full experience without a live key.
@@ -69,13 +80,14 @@ Runs the live pipeline over the labeled demo incidents and scores top-1 root-cau
 
 | Path | Role |
 | --- | --- |
-| `lib/orchestrator.ts` | Multi-agent pipeline: Vision → Synthesis → Skeptic, with telemetry |
-| `lib/agents.ts` | Per-agent prompt builders |
+| `lib/orchestrator.ts` | Multi-agent pipeline: Vision → Synthesis → Skeptic, with telemetry and retrieved priors |
+| `lib/agents.ts` | Per-agent prompt builders (incl. prior-incident context) |
+| `lib/incidentMemory.ts` | Local incident memory: persistence, keyword extraction, similarity scoring |
 | `lib/schema.ts` | Strict structured-output schemas (Cerebras JSON mode) |
 | `lib/cerebras.ts` | Cerebras chat-completions client + typed errors |
 | `lib/mockInvestigation.ts` | Deterministic sample generator for Demo mode |
-| `app/api/analyze/route.ts` | API route: demo vs live, honest error handling |
-| `app/page.tsx` + `components/` | Tabbed results workspace (Overview, Agents, Timeline, Evidence, Hypotheses, Safety, Diagnostics) |
+| `app/api/analyze/route.ts` | API route: demo vs live, prior-incident sanitization, honest error handling |
+| `app/page.tsx` + `components/` | Tabbed results workspace (Overview, Agents, Timeline, Evidence, Hypotheses, Safety, History, Diagnostics) |
 
 ## Stack
 
