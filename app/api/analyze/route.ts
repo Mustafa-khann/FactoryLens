@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { CerebrasError } from "@/lib/cerebras";
 import { createMockInvestigation } from "@/lib/mockInvestigation";
-import { runInvestigationPipeline } from "@/lib/orchestrator";
+import { runGeminiModelComparison, runInvestigationPipeline } from "@/lib/orchestrator";
 import type { Incident } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -38,6 +38,7 @@ export async function POST(request: Request) {
 
     const incident = body.incident;
     const imageDataUrl = isImageDataUrl(body.imageDataUrl) ? body.imageDataUrl : undefined;
+    const includeGeminiComparison = body.includeGeminiComparison === true;
 
     // Demo mode is an explicit, user-chosen path that returns clearly-labeled sample
     // data. Real analysis NEVER silently falls back to fabricated data — it fails honestly.
@@ -57,7 +58,11 @@ export async function POST(request: Request) {
     }
 
     try {
-      return NextResponse.json(await runInvestigationPipeline(incident, imageDataUrl));
+      const analysis = await runInvestigationPipeline(incident, imageDataUrl);
+      if (includeGeminiComparison) {
+        analysis.comparisons = [await runGeminiModelComparison(incident, imageDataUrl)];
+      }
+      return NextResponse.json(analysis);
     } catch (error) {
       const status = error instanceof CerebrasError ? error.status : undefined;
       const detail = error instanceof Error ? error.message : "Unknown analysis failure";

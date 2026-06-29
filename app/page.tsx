@@ -323,7 +323,7 @@ export default function Home() {
     timeoutsRef.current.push(doneTimeout);
   }
 
-  async function requestAnalysis() {
+  async function requestAnalysis(options: { includeGeminiComparison?: boolean } = {}) {
     const response = await fetch("/api/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -331,6 +331,7 @@ export default function Home() {
         incident,
         imageDataUrl: image.included ? image.dataUrl : undefined,
         mode: demoMode ? "demo" : "live",
+        includeGeminiComparison: options.includeGeminiComparison,
       }),
     });
 
@@ -380,7 +381,7 @@ export default function Home() {
   async function runSpeedDemo() {
     setSpeedDemoLoading(true);
     try {
-      const nextSpeedDemo = await requestAnalysis();
+      const nextSpeedDemo = await requestAnalysis({ includeGeminiComparison: true });
       setSpeedDemo(nextSpeedDemo);
     } catch {
       // No fabricated timings: leave the comparison empty on failure.
