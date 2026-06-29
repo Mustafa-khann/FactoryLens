@@ -109,9 +109,11 @@ export interface MujocoSimulationProps {
   incident?: Incident;
   /** Fold a fault reproduced in the twin back into the investigation. */
   onEvidenceChange?: (next: Incident) => void;
+  /** Start the war-room analysis once twin evidence has been captured. */
+  onRunInvestigation?: () => void | Promise<void>;
 }
 
-export function MujocoSimulation({ incident, onEvidenceChange }: MujocoSimulationProps = {}) {
+export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigation }: MujocoSimulationProps = {}) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const sceneRef = useRef<SceneRefs | null>(null);
   const simRef = useRef<SimRefs>({ mod: null, model: null, data: null });
@@ -139,6 +141,7 @@ export function MujocoSimulation({ incident, onEvidenceChange }: MujocoSimulatio
 
   const model = getModel(selectedId);
   metaRef.current = model;
+  const hasCapturedEvidence = Boolean(incident?.logs.trim() || incident?.timestampedEvents.length);
 
   const ctx = useCallback(() => {
     const { mod, model: m, data: d } = simRef.current;
@@ -709,15 +712,29 @@ export function MujocoSimulation({ incident, onEvidenceChange }: MujocoSimulatio
             </div>
 
             {onEvidenceChange ? (
-              <button
-                type="button"
-                onClick={captureEvidence}
-                disabled={status !== "ready" || !activeFailures.length}
-                className="mt-3 w-full rounded-lg bg-brand-600 px-3 py-2 text-[13px] font-medium text-white shadow-sm transition-colors hover:bg-brand-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
-                title={activeFailures.length ? "Send this reproduced fault into the investigation" : "Inject a fault first"}
-              >
-                {captured ? "Captured to incident ✓" : "Capture to incident evidence"}
-              </button>
+              <div className="mt-3 space-y-2">
+                <button
+                  type="button"
+                  onClick={captureEvidence}
+                  disabled={status !== "ready" || !activeFailures.length}
+                  className="w-full rounded-lg bg-brand-600 px-3 py-2 text-[13px] font-medium text-white shadow-sm transition-colors hover:bg-brand-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+                  title={activeFailures.length ? "Send this reproduced fault into the investigation" : "Inject a fault first"}
+                >
+                  {captured ? "Captured to incident evidence" : "Capture to incident evidence"}
+                </button>
+                {onRunInvestigation ? (
+                  <button
+                    type="button"
+                    onClick={() => void onRunInvestigation()}
+                    disabled={status !== "ready" || !hasCapturedEvidence}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[13px] font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+                    title={hasCapturedEvidence ? "Run the investigation" : "Capture evidence first"}
+                  >
+                    <Play className="h-3.5 w-3.5" />
+                    Run investigation
+                  </button>
+                ) : null}
+              </div>
             ) : null}
           </div>
         </div>
