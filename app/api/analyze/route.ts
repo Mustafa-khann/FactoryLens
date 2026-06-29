@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { CerebrasError } from "@/lib/cerebras";
 import { createMockInvestigation } from "@/lib/mockInvestigation";
 import { runInvestigationPipeline } from "@/lib/orchestrator";
-import type { Incident } from "@/lib/types";
+import type { Incident, PriorIncidentContext } from "@/lib/types";
 
 export const runtime = "nodejs";
 
@@ -29,6 +29,27 @@ function isImageDataUrl(value: unknown): value is string {
   return typeof value === "string" && /^data:image\/(png|jpeg|jpg|webp);base64,/i.test(value);
 }
 
+/** Sanitize the prior-incident context retrieved from the client's local memory before it reaches the model. */
+function parsePriorIncidents(value: unknown): PriorIncidentContext[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const clip = (text: unknown, max: number) => (typeof text === "string" ? text.slice(0, max) : "");
+  const priors = value
+    .filter(isRecord)
+    .slice(0, 5)
+    .map((item): PriorIncidentContext => ({
+      title: clip(item.title, 200),
+      machineType: clip(item.machineType, 120),
+      severity: (["low", "medium", "high", "critical"].includes(item.severity as string)
+        ? item.severity
+        : "medium") as PriorIncidentContext["severity"],
+      diagnosedRootCause: clip(item.diagnosedRootCause, 400),
+      confirmedRootCause: typeof item.confirmedRootCause === "string" ? clip(item.confirmedRootCause, 400) : undefined,
+      resolvedFix: typeof item.resolvedFix === "string" ? clip(item.resolvedFix, 400) : undefined,
+    }))
+    .filter((prior) => prior.title && prior.machineType);
+  return priors.length ? priors : undefined;
+}
+
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as unknown;
@@ -38,6 +59,7 @@ export async function POST(request: Request) {
 
     const incident = body.incident;
     const imageDataUrl = isImageDataUrl(body.imageDataUrl) ? body.imageDataUrl : undefined;
+    const priorIncidents = parsePriorIncidents(body.priorIncidents);
 
     // Demo mode is an explicit, user-chosen path that returns clearly-labeled sample
     // data. Real analysis NEVER silently falls back to fabricated data — it fails honestly.
@@ -57,7 +79,7 @@ export async function POST(request: Request) {
     }
 
     try {
-      return NextResponse.json(await runInvestigationPipeline(incident, imageDataUrl));
+      return NextResponse.json(await runInvestigationPipeline(incident, imageDataUrl, priorIncidents));
     } catch (error) {
       const status = error instanceof CerebrasError ? error.status : undefined;
       const detail = error instanceof Error ? error.message : "Unknown analysis failure";

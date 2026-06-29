@@ -8,6 +8,7 @@ import {
   type InvestigationResult,
   type MissingDataRequest,
   type PipelineTelemetry,
+  type PriorIncidentContext,
   type SkepticReview,
   type VisionObservations,
 } from "./types";
@@ -144,9 +145,10 @@ async function runSynthesisAgent(
   telemetry: Telemetry,
   incident: Parameters<typeof buildFullInvestigationMessages>[0],
   visionFindings: string[],
+  priorIncidents?: PriorIncidentContext[],
 ): Promise<{ result: InvestigationResult; warning?: string }> {
   const first = await callCerebrasChatCompletion({
-    messages: buildFullInvestigationMessages(incident, undefined, visionFindings),
+    messages: buildFullInvestigationMessages(incident, undefined, visionFindings, priorIncidents),
     responseFormat: investigationResultResponseFormat,
     temperature: 0.2,
     maxTokens: 5000,
@@ -235,12 +237,13 @@ function applySkepticReview(result: InvestigationResult, skeptic: SkepticOutput)
 export async function runInvestigationPipeline(
   incident: Parameters<typeof buildFullInvestigationMessages>[0],
   imageDataUrl?: string,
+  priorIncidents?: PriorIncidentContext[],
 ): Promise<AnalysisResponse> {
   const telemetry = new Telemetry();
   const startedAt = Date.now();
 
   const vision = await runVisionAgent(telemetry, incident, imageDataUrl);
-  const { result: synthesizedRaw, warning } = await runSynthesisAgent(telemetry, incident, vision.observations);
+  const { result: synthesizedRaw, warning } = await runSynthesisAgent(telemetry, incident, vision.observations, priorIncidents);
   const synthesized = normalizeConfidences(synthesizedRaw);
 
   const withVision: InvestigationResult = { ...synthesized, visionObservations: vision };

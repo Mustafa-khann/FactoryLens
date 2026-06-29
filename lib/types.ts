@@ -147,6 +147,18 @@ export interface InvestigationResult {
   skepticReview?: SkepticReview;
 }
 
+/** A compact prior drawn from incident memory and fed into the live pipeline so it can recognise repeat failures. */
+export interface PriorIncidentContext {
+  title: string;
+  machineType: string;
+  severity: IncidentSeverity;
+  diagnosedRootCause: string;
+  /** The confirmed root cause once a human recorded the real resolution (high-signal). */
+  confirmedRootCause?: string;
+  /** What actually fixed the past incident. */
+  resolvedFix?: string;
+}
+
 export interface AnalysisUsage {
   prompt_tokens?: number;
   completion_tokens?: number;
