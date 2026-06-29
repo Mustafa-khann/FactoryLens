@@ -8,8 +8,8 @@ meshes, inertias, and tuned actuators — running a pick-and-place cycle off a c
 This is the simulation substrate for the **Adversarial Factory Digital Twin** loop:
 
 ```
-1. UR5e factory cell runs a pick-and-place cycle      (cell.py)
-2. A fault is injected: slip · jam · misclassification · collision-risk   [next]
+1. UR5e factory cell runs a pick-and-place cycle      (cell.py)        ✅
+2. A fault is injected: slip · jam · misclassify · collision  (faults.py)  ✅
 3. Gemma reads the cell state + rendered image         [next]
 4. Multiple agents diagnose the cause                  (reuses lib/ pipeline)
 5. A recovery agent proposes an action                 [next]
@@ -23,10 +23,21 @@ This is the simulation substrate for the **Adversarial Factory Digital Twin** lo
   MuJoCo dynamics; grasped parts are carried by the flange and fall under real gravity
   when released or slipped. `snapshot()` exposes everything an agent needs (joint angles,
   actuator torques, part poses, gripper-to-pick / gripper-to-human distances, belt speed,
-  classifier vs. true class).
+  conveyor motor current, classifier vs. true class).
+- `faults.py` — adversarial fault injection, one per failure family. Each perturbs the
+  cycle physically and carries a hidden `GroundTruth` (real cause + betraying signals +
+  what a correct recovery must achieve) used only to score the agents:
+  - **slip** — gripper loses the part mid-transfer; it falls to the floor.
+  - **jam** — belt stalls, drive current climbs above nominal, parts stop indexing.
+  - **misclassify** — vision passes a defective part as good (quality escape).
+  - **collision** — a trajectory error drives the arm into the human keep-out zone.
 - `robots/ur5e/factory_cell.xml` — the cell scene: UR5e + conveyor + bin + parts + a human
   safety keep-out zone, placed in the arm's measured reachable workspace.
 - Headless rendering via OSMesa (no GPU needed).
+
+```bash
+python run.py --fault collision --out out   # inject a fault, capture the incident + frame
+```
 
 ## Setup
 

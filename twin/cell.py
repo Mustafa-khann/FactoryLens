@@ -35,7 +35,7 @@ BELT_Y = 0.449
 BELT_TOP_Z = 0.05
 PICK = np.array([-0.447, 0.449, 0.085])       # where a part sits ready to be picked
 BIN = np.array([-0.520, -0.365, 0.10])         # drop target (bin centre)
-SAFETY = np.array([-0.92, 0.45, 0.13])         # human keep-out centre
+SAFETY = np.array([-0.52, -0.62, 0.13])        # human keep-out centre (operator unloading the bin)
 SAFETY_RADIUS = 0.15
 PART_HALF = 0.032
 GRASP_OFFSET = np.array([0.0, 0.0, -0.04])     # held part rides just below the flange
@@ -64,6 +64,7 @@ class CellState:
     joint_target: dict
     actuator_force: dict          # |torque| per joint, our motor-current proxy
     belt_speed: float             # m/s the belt is advancing parts
+    belt_motor_current: float     # conveyor drive current (A); spikes when jammed
     parts: list                   # [{id, pos, on_floor, in_bin, true_class}]
     held_part: Optional[str]
     gripper_pos: tuple
@@ -109,7 +110,8 @@ class FactoryCell:
         self.classifier_override: dict = {}
         self.fault_label: Optional[str] = None
         self.belt_jammed = False
-        self.motor_overload = 0.0  # extra reported torque (jam proxy)
+        self.belt_motor_current_nominal = 1.8       # amps, nominal conveyor drive
+        self.belt_jam_current = 0.0                 # extra drive current while straining on a jam
 
         self._aid = {n: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, n) for n in ACTUATOR_NAMES}
         self._jqadr = {n: self.model.jnt_qposadr[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, n)] for n in JOINT_NAMES}
@@ -217,7 +219,8 @@ class FactoryCell:
     def snapshot(self) -> CellState:
         jpos = {n: round(float(self.data.qpos[self._jqadr[n]]), 4) for n in JOINT_NAMES}
         jtgt = {n: round(float(v + self.ctrl_bias[k]), 4) for k, (n, v) in enumerate(zip(JOINT_NAMES, PHASE_SETPOINTS[self.phase]))}
-        aforce = {n: round(abs(float(self.data.actuator_force[self._aid[n]])) + self.motor_overload, 3) for n in ACTUATOR_NAMES}
+        aforce = {n: round(abs(float(self.data.actuator_force[self._aid[n]])), 3) for n in ACTUATOR_NAMES}
+        belt_current = round(self.belt_motor_current_nominal + (self.belt_jam_current if self.belt_jammed else 0.0), 2)
 
         grip = self.flange()
         safety_xy = np.array([SAFETY[0], SAFETY[1], grip[2]])
@@ -245,6 +248,7 @@ class FactoryCell:
             joint_target=jtgt,
             actuator_force=aforce,
             belt_speed=0.0 if self.belt_jammed else round(self.belt_speed, 4),
+            belt_motor_current=belt_current,
             parts=parts,
             held_part=(f"part{self.held_part}" if self.held_part is not None else None),
             gripper_pos=tuple(round(float(v), 3) for v in grip),

@@ -50,9 +50,9 @@
     <geom name="bin_w3" type="box" pos="-0.41 -0.365 0.07" size="0.008 0.11 0.05" material="bin_mat"/>
     <geom name="bin_w4" type="box" pos="-0.63 -0.365 0.07" size="0.008 0.11 0.05" material="bin_mat"/>
 
-    <!-- human safety keep-out zone (belt loading station) -->
-    <geom name="safety_zone" type="cylinder" pos="-0.92 0.45 0.13" size="0.15 0.13" material="safety_mat" contype="0" conaffinity="0"/>
-    <site name="safety_center" pos="-0.92 0.45 0.13" size="0.02" rgba="0.9 0 0 0.7"/>
+    <!-- human safety keep-out zone (operator unloading the bin) -->
+    <geom name="safety_zone" type="cylinder" pos="-0.52 -0.62 0.13" size="0.15 0.13" material="safety_mat" contype="0" conaffinity="0"/>
+    <site name="safety_center" pos="-0.52 -0.62 0.13" size="0.02" rgba="0.9 0 0 0.7"/>
 
     <!-- parts on the belt: part2 is genuinely defective (different colour) -->
     <body name="part0" pos="-0.447 0.449 0.085">
