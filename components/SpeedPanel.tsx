@@ -1,0 +1,116 @@
+"use client";
+
+import { Gauge, Layers, Play, RefreshCw, Timer, Zap } from "lucide-react";
+import { DEFAULT_CEREBRAS_MODEL, type AnalysisResponse } from "@/lib/types";
+import { Panel } from "./ui/Panel";
+import { Button } from "./ui/Button";
+
+interface SpeedPanelProps {
+  analysis?: AnalysisResponse | null;
+  elapsedMs: number;
+  speedDemo?: AnalysisResponse | null;
+  speedDemoLoading: boolean;
+  onRunSpeedDemo: () => void;
+}
+
+function formatMs(value?: number) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+  if (value < 1000) return `${Math.round(value)} ms`;
+  return `${(value / 1000).toFixed(2)} s`;
+}
+
+function formatRate(value?: number) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+  return `${Math.round(value).toLocaleString()}`;
+}
+
+function Stat({ icon, label, value, unit }: { icon: React.ReactNode; label: string; value: string; unit?: string }) {
+  return (
+    <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-3">
+      <p className="flex items-center gap-1.5 text-[11px] font-medium text-slate-500">
+        <span className="text-slate-400">{icon}</span>
+        {label}
+      </p>
+      <p className="mt-1 font-mono text-lg font-semibold tabular-nums text-slate-900">
+        {value}
+        {unit ? <span className="ml-1 text-xs font-medium text-slate-400">{unit}</span> : null}
+      </p>
+    </div>
+  );
+}
+
+export function SpeedPanel({ analysis, elapsedMs, speedDemo, speedDemoLoading, onRunSpeedDemo }: SpeedPanelProps) {
+  const pipeline = analysis?.pipeline ?? speedDemo?.pipeline;
+  const wallMs = pipeline?.wallMs ?? analysis?.elapsedMs ?? elapsedMs;
+  const gpuMs = pipeline?.gpuBaselineMs;
+  const tokps = pipeline?.tokensPerSecond ?? analysis?.speed.outputTokensPerSecond;
+  const speedup = gpuMs && wallMs ? gpuMs / wallMs : undefined;
+
+  // Bar widths (Cerebras pinned small, GPU baseline scaled relative — capped for layout).
+  const ratio = speedup ? Math.min(speedup, 30) : 1;
+  const cerebrasWidth = 100 / (1 + ratio);
+  const gpuWidth = 100 - cerebrasWidth;
+
+  return (
+    <Panel
+      title="Cerebras Speed"
+      subtitle="A full multi-agent investigation in seconds — the workflow only works at this latency."
+      icon={<Zap className="h-4 w-4" />}
+      accent="brand"
+      trailing={
+        <Button type="button" size="sm" variant="secondary" onClick={onRunSpeedDemo} disabled={speedDemoLoading}>
+          {speedDemoLoading ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+          Re-run
+        </Button>
+      }
+      bodyClassName="space-y-4 p-5"
+    >
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <Stat icon={<Timer className="h-3.5 w-3.5" />} label="Total time" value={formatMs(wallMs)} />
+        <Stat icon={<Layers className="h-3.5 w-3.5" />} label="Gemma 4 calls" value={pipeline ? String(pipeline.calls) : "—"} />
+        <Stat icon={<Gauge className="h-3.5 w-3.5" />} label="Throughput" value={formatRate(tokps)} unit="tok/s" />
+        <Stat icon={<Zap className="h-3.5 w-3.5" />} label="First token" value={formatMs(pipeline?.ttftMs ?? analysis?.speed.timeToFirstTokenMs)} />
+      </div>
+
+      {/* Side-by-side latency comparison vs an estimated GPU baseline */}
+      <div className="rounded-lg border border-slate-200 bg-white p-3.5">
+        <div className="mb-2.5 flex items-center justify-between">
+          <p className="text-[11px] font-semibold uppercase tracking-label text-slate-500">Latency vs GPU baseline</p>
+          {speedup ? (
+            <span className="rounded-full bg-brand-50 px-2 py-0.5 text-xs font-semibold text-brand-700">≈{speedup.toFixed(0)}× faster</span>
+          ) : null}
+        </div>
+        <div className="space-y-2">
+          <div>
+            <div className="mb-1 flex items-center justify-between text-[11px]">
+              <span className="font-medium text-brand-700">Cerebras · {pipeline?.model ?? DEFAULT_CEREBRAS_MODEL}</span>
+              <span className="font-mono tabular-nums text-slate-600">{formatMs(wallMs)}</span>
+            </div>
+            <div className="h-2.5 overflow-hidden rounded-full bg-slate-100">
+              <div className="h-full rounded-full bg-brand-600" style={{ width: `${Math.max(4, cerebrasWidth)}%` }} />
+            </div>
+          </div>
+          <div>
+            <div className="mb-1 flex items-center justify-between text-[11px]">
+              <span className="font-medium text-slate-500">Est. GPU baseline (~55 tok/s)</span>
+              <span className="font-mono tabular-nums text-slate-500">{formatMs(gpuMs)}</span>
+            </div>
+            <div className="h-2.5 overflow-hidden rounded-full bg-slate-100">
+              <div className="h-full rounded-full bg-slate-300" style={{ width: `${Math.max(4, gpuWidth)}%` }} />
+            </div>
+          </div>
+        </div>
+        <p className="mt-2.5 text-[11px] leading-4 text-slate-400">
+          Baseline estimated from the same token volume at a typical GPU-served rate. Cerebras figures are measured per request.
+        </p>
+      </div>
+
+      {analysis?.timeInfo ? (
+        <details className="rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-slate-500">
+          <summary className="cursor-pointer select-none font-medium text-slate-600 hover:text-slate-900">Provider time_info</summary>
+          <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono thin-scrollbar">{JSON.stringify(analysis.timeInfo, null, 2)}</pre>
+        </details>
+      ) : null}
+    </Panel>
+  );
+}
