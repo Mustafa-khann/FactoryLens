@@ -31,6 +31,14 @@ class GroundTruth:
     expected_recovery: str     # what a correct recovery must achieve (for the evaluator)
 
 
+@dataclass
+class Symptom:
+    """What an operator/sensors observe — NO cause leaked. This frames the incident for the agents."""
+    title: str
+    operator_note: str
+    severity: str              # low | medium | high | critical
+
+
 class Fault:
     """Base class. A fault arms itself, perturbs the cell each step, and reports manifestation."""
 
@@ -47,6 +55,9 @@ class Fault:
         return False
 
     def ground_truth(self) -> GroundTruth:
+        raise NotImplementedError
+
+    def symptom(self) -> Symptom:
         raise NotImplementedError
 
 
@@ -79,6 +90,14 @@ class SlipFault(Fault):
                               "slower transfer; do NOT continue placing nothing.",
         )
 
+    def symptom(self):
+        return Symptom(
+            title="Bin came up short — part missing after transfer cycle",
+            operator_note="Operator reports the bin was one part short this cycle and a part is sitting on the "
+                          "floor near the bin. The arm completed its place motion but nothing was deposited.",
+            severity="high",
+        )
+
 
 class JamFault(Fault):
     id = "jam"
@@ -108,13 +127,23 @@ class JamFault(Fault):
                               "then resume; do NOT keep commanding the stalled belt.",
         )
 
+    def symptom(self):
+        return Symptom(
+            title="Conveyor not indexing — drive current rising, pick point starved",
+            operator_note="Operator reports the belt has stopped moving and the drive is humming/straining. "
+                          "No new parts are arriving at the pick point and the robot is waiting.",
+            severity="high",
+        )
+
 
 class MisclassifyFault(Fault):
     id = "misclassify"
 
     def arm(self, cell):
-        # the defective part2 is passed off as good
+        # the defective part2 is passed off as good — but the classifier is only weakly sure,
+        # which is the observable handle a diagnosis agent can catch.
         cell.classifier_override["part2"] = "good"
+        cell.classifier_confidence_override["part2"] = 0.58
 
     def manifested(self, state):
         p = next((p for p in state.parts if p["id"] == "part2"), None)
@@ -129,6 +158,14 @@ class MisclassifyFault(Fault):
                      "a defective part is routed to the good bin"],
             expected_recovery="Quarantine part2, flag the classifier confidence/threshold, and re-inspect; "
                               "do NOT place it in the good bin.",
+        )
+
+    def symptom(self):
+        return Symptom(
+            title="Low-confidence quality pass — possible defective unit accepted",
+            operator_note="QA flagged that part2 was accepted as 'good' but the vision confidence (0.58) is "
+                          "below the 0.85 acceptance threshold. Unsure whether to ship it.",
+            severity="high",
         )
 
 
@@ -156,6 +193,14 @@ class CollisionFault(Fault):
                               "keep-out zone; do NOT proceed through the breaching trajectory.",
         )
 
+    def symptom(self):
+        return Symptom(
+            title="Safety keep-out breach — arm entered the operator zone",
+            operator_note="Light curtain / safety monitor tripped: during the place swing the gripper came "
+                          "within the human keep-out radius of the bin-unload station. Cycle halted.",
+            severity="critical",
+        )
+
 
 FAULTS = {f.id: f for f in [SlipFault(), JamFault(), MisclassifyFault(), CollisionFault()]}
 
@@ -176,6 +221,7 @@ class IncidentCapture:
     """Everything produced when a fault is injected and caught — the input to diagnosis."""
     fault_id: str
     ground_truth: GroundTruth
+    symptom: Symptom           # observable framing shown to the diagnosis agents
     baseline: CellState        # a clean snapshot before the fault
     incident: CellState        # the snapshot at the moment the fault manifested
     manifested: bool
@@ -238,6 +284,7 @@ def run_scenario(
     capture = IncidentCapture(
         fault_id=fault_id,
         ground_truth=fault.ground_truth(),
+        symptom=fault.symptom(),
         baseline=baseline,
         incident=incident,
         manifested=manifested,

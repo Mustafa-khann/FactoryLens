@@ -8,10 +8,10 @@ meshes, inertias, and tuned actuators — running a pick-and-place cycle off a c
 This is the simulation substrate for the **Adversarial Factory Digital Twin** loop:
 
 ```
-1. UR5e factory cell runs a pick-and-place cycle      (cell.py)        ✅
+1. UR5e factory cell runs a pick-and-place cycle      (cell.py)            ✅
 2. A fault is injected: slip · jam · misclassify · collision  (faults.py)  ✅
-3. Gemma reads the cell state + rendered image         [next]
-4. Multiple agents diagnose the cause                  (reuses lib/ pipeline)
+3. Gemma reads the cell state + rendered image         (incident.py)       ✅
+4. Multiple agents diagnose the cause                  (diagnose.py → lib/) ✅
 5. A recovery agent proposes an action                 [next]
 6. The action is applied back in the sim and scored    [next — closed loop]
 7. A report agent writes a deployment-readiness note   [next]
@@ -35,9 +35,22 @@ This is the simulation substrate for the **Adversarial Factory Digital Twin** lo
   safety keep-out zone, placed in the arm's measured reachable workspace.
 - Headless rendering via OSMesa (no GPU needed).
 
+- `incident.py` — packages a capture into the FactoryLens `Incident` shape using **only
+  observable telemetry** (the hidden ground truth and each part's true class are withheld,
+  so the agents must actually diagnose). The rendered frame becomes a PNG data URL.
+- `api_client.py` / `diagnose.py` — POST the incident to the existing FactoryLens analyze
+  pipeline (Vision + Synthesis + Skeptic), then score Gemma's call against the hidden
+  ground truth by fault family. Gemma never sees the answer.
+
 ```bash
-python run.py --fault collision --out out   # inject a fault, capture the incident + frame
+python run.py --fault collision --out out          # inject a fault, capture incident + frame
+python run.py --fault collision --diagnose          # also run it through the agents
+python run.py --diagnose-all                        # diagnose all four, print a scorecard
 ```
+
+Diagnosis calls `$FACTORYLENS_API` (default `http://localhost:3000`). For a **live**
+diagnosis, run `npm run dev` in the repo root with `CEREBRAS_API_KEY` set. `--mode demo`
+exercises the full pipeline plumbing without a key (returns sample data, not a real call).
 
 ## Setup
 

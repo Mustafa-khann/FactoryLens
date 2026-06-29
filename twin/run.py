@@ -8,9 +8,13 @@ diagnosis, recovery, closed-loop evaluation, and a deployment-readiness report a
 on the state and image this produces.
 
 Usage:
-    python run.py                         # nominal cycle
-    python run.py --fault slip --out out  # inject a fault and capture the incident
-    python run.py --fault collision
+    python run.py                              # nominal cycle
+    python run.py --fault slip --out out       # inject a fault and capture the incident
+    python run.py --fault collision --diagnose # also run it through the FactoryLens agents
+    python run.py --diagnose-all               # diagnose all four faults, print a scorecard
+
+`--diagnose` calls the FactoryLens API ($FACTORYLENS_API, default http://localhost:3000);
+run `npm run dev` first and set CEREBRAS_API_KEY for a live diagnosis.
 """
 from __future__ import annotations
 
@@ -33,9 +37,32 @@ def _save_image(img, path: Path):
         print(f"render skipped: {exc}")
 
 
+def _print_diagnosis(cap, analysis, score):
+    gt = cap.ground_truth
+    mark = "✓ CORRECT" if score.correct else "✗ missed"
+    print(f"\n──── {cap.fault_id.upper()} ────")
+    print(f"  symptom shown : {cap.symptom.title}")
+    print(f"  Gemma's call  : {score.diagnosed_root_cause[:110]}")
+    print(f"  → fault family: {score.predicted}  [{mark}]  (confidence: {score.confidence_level})")
+    print(f"  ground truth  : {gt.summary[:110]}")
+    print(f"  evidence      : {score.evidence}")
+
+
+def _diagnose(fault_id, mode, base_url):
+    from diagnose import diagnose_fault
+
+    cap, analysis, score = diagnose_fault(fault_id, mode=mode, base_url=base_url)
+    _print_diagnosis(cap, analysis, score)
+    return score
+
+
 def main():
     ap = argparse.ArgumentParser(description="Run the FactoryLens UR5e digital twin.")
     ap.add_argument("--fault", choices=sorted(FAULTS), help="inject an adversarial fault")
+    ap.add_argument("--diagnose", action="store_true", help="run the injected fault through the FactoryLens agents")
+    ap.add_argument("--diagnose-all", action="store_true", help="diagnose all four faults and print a scorecard")
+    ap.add_argument("--mode", choices=["live", "demo"], default="live", help="diagnosis mode")
+    ap.add_argument("--api", type=str, default=None, help="FactoryLens API base URL (overrides $FACTORYLENS_API)")
     ap.add_argument("--seconds", type=float, default=6.0, help="sim seconds for the nominal run")
     ap.add_argument("--warmup", type=float, default=2.0, help="nominal seconds before injecting the fault")
     ap.add_argument("--out", type=str, default="out", help="output directory")
@@ -44,6 +71,16 @@ def main():
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+
+    if args.diagnose_all:
+        scores = [_diagnose(fid, args.mode, args.api) for fid in sorted(FAULTS)]
+        hits = sum(s.correct for s in scores)
+        print(f"\n=== diagnosis scorecard: {hits}/{len(scores)} faults correctly identified ===")
+        return
+
+    if args.fault and args.diagnose:
+        _diagnose(args.fault, args.mode, args.api)
+        return
 
     if args.fault:
         cap = run_scenario(args.fault, warmup_s=args.warmup, seed=args.seed)

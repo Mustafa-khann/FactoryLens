@@ -73,6 +73,8 @@ class CellState:
     safety_radius: float
     safety_breached: bool
     classifier: dict              # {part_id: predicted_class}
+    classifier_confidence: dict   # {part_id: 0..1 confidence in that call}
+    classifier_threshold: float   # accept threshold below which a call should be re-inspected
     contacts: int
     notes: list = field(default_factory=list)
 
@@ -108,6 +110,8 @@ class FactoryCell:
 
         # vision classifier state (corruptible by the misclassification fault)
         self.classifier_override: dict = {}
+        self.classifier_confidence_override: dict = {}
+        self.classifier_threshold = 0.85
         self.fault_label: Optional[str] = None
         self.belt_jammed = False
         self.belt_motor_current_nominal = 1.8       # amps, nominal conveyor drive
@@ -226,7 +230,7 @@ class FactoryCell:
         safety_xy = np.array([SAFETY[0], SAFETY[1], grip[2]])
         to_safety = float(np.linalg.norm(grip - safety_xy))
 
-        parts, classifier = [], {}
+        parts, classifier, confidence = [], {}, {}
         for i in range(3):
             p = self._part_xpos(i)
             in_bin = bool(abs(p[0] - BIN[0]) < 0.12 and abs(p[1] - BIN[1]) < 0.12 and p[2] < 0.12)
@@ -237,7 +241,9 @@ class FactoryCell:
                 "in_bin": in_bin,
                 "true_class": self.PART_CLASSES[i],
             })
-            classifier[f"part{i}"] = self.classifier_override.get(f"part{i}", self.PART_CLASSES[i])
+            pid = f"part{i}"
+            classifier[pid] = self.classifier_override.get(pid, self.PART_CLASSES[i])
+            confidence[pid] = round(self.classifier_confidence_override.get(pid, 0.96), 2)
 
         return CellState(
             t=round(float(self.data.time), 3),
@@ -257,6 +263,8 @@ class FactoryCell:
             safety_radius=SAFETY_RADIUS,
             safety_breached=bool(to_safety < SAFETY_RADIUS),
             classifier=classifier,
+            classifier_confidence=confidence,
+            classifier_threshold=self.classifier_threshold,
             contacts=int(self.data.ncon),
         )
 
