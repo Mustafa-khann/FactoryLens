@@ -1,0 +1,71 @@
+<mujoco model="factory_cell_ur5e">
+  <!-- A factory work-cell built around the real Universal Robots UR5e from MuJoCo Menagerie.
+       The robot is the genuine validated model (real meshes, inertias, tuned actuators); the
+       conveyor / bin / parts / human safety zone are placed in the arm's measured workspace. -->
+  <compiler angle="radian" meshdir="assets" autolimits="true"/>
+  <option integrator="implicitfast"/>
+
+  <include file="ur5e.xml"/>
+
+  <visual>
+    <global offwidth="960" offheight="720"/>
+    <headlight diffuse="0.55 0.55 0.55" ambient="0.4 0.4 0.4" specular="0.1 0.1 0.1"/>
+    <quality shadowsize="4096"/>
+    <map force="0.1" zfar="30"/>
+  </visual>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.26 0.28 0.32" rgb2="0.31 0.33 0.37"
+             width="300" height="300"/>
+    <material name="floor_mat" texture="grid" texrepeat="6 6" reflectance="0.15"/>
+    <material name="belt_mat" rgba="0.13 0.14 0.17 1"/>
+    <material name="belt_rail" rgba="0.55 0.5 0.12 1"/>
+    <material name="bin_mat" rgba="0.15 0.42 0.62 0.55"/>
+    <material name="safety_mat" rgba="0.85 0.1 0.1 0.22"/>
+    <material name="part_good" rgba="0.82 0.68 0.22 1"/>
+    <material name="part_defect" rgba="0.75 0.25 0.2 1"/>
+    <material name="pedestal_mat" rgba="0.22 0.23 0.26 1"/>
+  </asset>
+
+  <worldbody>
+    <light name="key" pos="1.0 -1.0 2.4" dir="-0.4 0.4 -1" diffuse="0.7 0.7 0.7"/>
+    <light name="fill" pos="-1.2 1.2 2.0" dir="0.4 -0.4 -1" diffuse="0.3 0.3 0.3"/>
+    <camera name="cell" pos="1.75 -1.35 1.25" xyaxes="0.69 0.72 0 -0.36 0.34 0.87"/>
+    <camera name="topdown" pos="-0.45 0.05 2.0" xyaxes="1 0 0 0 1 0"/>
+
+    <geom name="floor" type="plane" size="4 4 0.1" material="floor_mat"/>
+
+    <!-- robot mounting pedestal -->
+    <geom name="pedestal" type="cylinder" pos="0 0 -0.001" size="0.13 0.02" material="pedestal_mat"/>
+
+    <!-- conveyor belt (parts ride this toward the pick point) -->
+    <geom name="belt" type="box" pos="-0.55 0.449 0.025" size="0.40 0.09 0.025" material="belt_mat"/>
+    <geom name="belt_rail_n" type="box" pos="-0.55 0.355 0.06" size="0.40 0.008 0.04" material="belt_rail"/>
+    <geom name="belt_rail_f" type="box" pos="-0.55 0.543 0.06" size="0.40 0.008 0.04" material="belt_rail"/>
+
+    <!-- drop bin at the place point -->
+    <geom name="bin_floor" type="box" pos="-0.52 -0.365 0.02" size="0.11 0.11 0.02" material="bin_mat"/>
+    <geom name="bin_w1" type="box" pos="-0.52 -0.255 0.07" size="0.11 0.008 0.05" material="bin_mat"/>
+    <geom name="bin_w2" type="box" pos="-0.52 -0.475 0.07" size="0.11 0.008 0.05" material="bin_mat"/>
+    <geom name="bin_w3" type="box" pos="-0.41 -0.365 0.07" size="0.008 0.11 0.05" material="bin_mat"/>
+    <geom name="bin_w4" type="box" pos="-0.63 -0.365 0.07" size="0.008 0.11 0.05" material="bin_mat"/>
+
+    <!-- human safety keep-out zone (belt loading station) -->
+    <geom name="safety_zone" type="cylinder" pos="-0.92 0.45 0.13" size="0.15 0.13" material="safety_mat" contype="0" conaffinity="0"/>
+    <site name="safety_center" pos="-0.92 0.45 0.13" size="0.02" rgba="0.9 0 0 0.7"/>
+
+    <!-- parts on the belt: part2 is genuinely defective (different colour) -->
+    <body name="part0" pos="-0.447 0.449 0.085">
+      <freejoint name="part0_free"/>
+      <geom name="part0_geom" type="box" size="0.032 0.032 0.032" material="part_good" mass="0.2" friction="1 0.05 0.001"/>
+    </body>
+    <body name="part1" pos="-0.640 0.449 0.085">
+      <freejoint name="part1_free"/>
+      <geom name="part1_geom" type="box" size="0.032 0.032 0.032" material="part_good" mass="0.2" friction="1 0.05 0.001"/>
+    </body>
+    <body name="part2" pos="-0.825 0.449 0.085">
+      <freejoint name="part2_free"/>
+      <geom name="part2_geom" type="box" size="0.032 0.032 0.032" material="part_defect" mass="0.2" friction="1 0.05 0.001"/>
+    </body>
+  </worldbody>
+</mujoco>
