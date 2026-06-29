@@ -3,8 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { Activity, AlertTriangle, Cpu, Pause, Play, RotateCcw } from "lucide-react";
+import { Activity, AlertTriangle, CheckCircle2, Cpu, FileText, Pause, Play, RotateCcw, ShieldCheck } from "lucide-react";
 import { Panel } from "@/components/ui/Panel";
+import { Button } from "@/components/ui/Button";
 import { loadMujocoModule, stageAndLoad, type MjDataHandle, type MjModelHandle, type MujocoModule } from "@/lib/mujoco/loader";
 import { getModel, SIM_MODELS, type SimController, type SimModel, type TelemetryChannel } from "@/lib/mujoco/models";
 import type { Incident, TimelineEvent } from "@/lib/types";
@@ -104,6 +105,44 @@ interface SimRefs {
   data: MjDataHandle | null;
 }
 
+function SimStatusPill({ label, value, tone = "neutral" }: { label: string; value: string; tone?: "neutral" | "good" | "warn" | "bad" }) {
+  const toneClass =
+    tone === "good"
+      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+      : tone === "warn"
+        ? "border-amber-200 bg-amber-50 text-amber-700"
+        : tone === "bad"
+          ? "border-red-200 bg-red-50 text-red-700"
+          : "border-slate-200 bg-white text-slate-600";
+
+  return (
+    <span className={`inline-flex h-8 items-center gap-2 rounded-lg border px-2.5 text-xs font-medium ${toneClass}`}>
+      <span className="text-slate-400">{label}</span>
+      <span className="font-mono font-semibold tabular-nums text-current">{value}</span>
+    </span>
+  );
+}
+
+function FlowRow({ index, title, caption, state }: { index: number; title: string; caption: string; state: "complete" | "active" | "idle" }) {
+  const active = state === "active";
+  const complete = state === "complete";
+  return (
+    <div className="flex gap-3">
+      <span
+        className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[11px] font-semibold ${
+          complete ? "bg-emerald-600 text-white" : active ? "bg-cyan-700 text-white" : "bg-slate-100 text-slate-500"
+        }`}
+      >
+        {complete ? <CheckCircle2 className="h-3.5 w-3.5" /> : index}
+      </span>
+      <div className="min-w-0">
+        <p className="text-[13px] font-semibold text-slate-900">{title}</p>
+        <p className="mt-0.5 text-xs leading-5 text-slate-500">{caption}</p>
+      </div>
+    </div>
+  );
+}
+
 export interface MujocoSimulationProps {
   /** The incident in focus — used as the base when capturing twin evidence. */
   incident?: Incident;
@@ -111,9 +150,14 @@ export interface MujocoSimulationProps {
   onEvidenceChange?: (next: Incident) => void;
   /** Start the war-room analysis once twin evidence has been captured. */
   onRunInvestigation?: () => void | Promise<void>;
+  /** Report which fault ids were captured (so the verdict can later verify the fix). */
+  onFaultsCaptured?: (faultIds: string[]) => void;
+  /** Bumping `nonce` (from the verdict, post-analysis) reproduces `faults` in the
+   *  twin and then applies the recommended fix, verifying recovery. */
+  verifyRequest?: { nonce: number; faults: string[] };
 }
 
-export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigation }: MujocoSimulationProps = {}) {
+export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigation, onFaultsCaptured, verifyRequest }: MujocoSimulationProps = {}) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const sceneRef = useRef<SceneRefs | null>(null);
   const simRef = useRef<SimRefs>({ mod: null, model: null, data: null });
@@ -138,6 +182,11 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
   const [chips, setChips] = useState<Chip[]>([]);
   const [simTime, setSimTime] = useState(0);
   const [captured, setCaptured] = useState(false);
+  const [verifyState, setVerifyState] = useState<"idle" | "verifying" | "verified">("idle");
+  const [verifyMsg, setVerifyMsg] = useState("");
+  // Symptom channels (and a stabilization counter) watched while verifying a fix.
+  const verifyRef = useRef<{ symptoms: string[]; ticks: number } | null>(null);
+  const verifyHandledRef = useRef(0);
 
   const model = getModel(selectedId);
   metaRef.current = model;
@@ -230,7 +279,7 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     mount.appendChild(renderer.domElement);
     renderer.domElement.style.display = "block";
-    renderer.domElement.style.borderRadius = "10px";
+    renderer.domElement.style.borderRadius = "8px";
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(45, width / height, 0.03, 100);
@@ -353,6 +402,23 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
+  // ── Verify-the-fix request from the verdict (post-analysis) ──────────────
+  // Reproduce the diagnosed fault in the twin, let the symptom show, then apply
+  // the recommended fix and confirm the breached telemetry recovers.
+  useEffect(() => {
+    if (!verifyRequest || verifyRequest.nonce <= verifyHandledRef.current) return;
+    if (status !== "ready" || !verifyRequest.faults.length) return;
+    verifyHandledRef.current = verifyRequest.nonce;
+    const flagIds = verifyRequest.faults.filter((id) => model.failures.find((f) => f.id === id)?.controllerFlag);
+    setActiveFailures(verifyRequest.faults);
+    failuresRef.current = verifyRequest.faults;
+    if (controllerRef.current) controllerRef.current.flags = new Set(flagIds);
+    setVerifyState("idle");
+    const t = window.setTimeout(() => verifyFix(), 2600); // let the fault manifest first
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [verifyRequest?.nonce, status]);
+
   // ── Per-frame helpers (defined inline to close over refs) ────────────────
   function rebuildMeshes(sc: SceneRefs, m: MjModelHandle) {
     for (const { mesh } of sc.meshes) {
@@ -440,6 +506,23 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
     setTelemetry(meta.telemetry.map((ch) => readChannel(ch, c.data, ctel)));
     setChips(controller ? controller.status(c) : []);
     setSimTime(c.data.time);
+
+    // While verifying a fix, wait for the previously-breached channels to settle
+    // back inside their nominal bands, then declare the fix confirmed.
+    if (verifyRef.current) {
+      const stillBad = meta.telemetry.some((ch) => {
+        if (!ch.nominal) return false;
+        const v = readChannel(ch, c.data, ctel);
+        return v < ch.nominal[0] || v > ch.nominal[1];
+      });
+      verifyRef.current.ticks++;
+      if (!stillBad && verifyRef.current.ticks > 6) {
+        const s = verifyRef.current.symptoms;
+        setVerifyMsg(s.length ? `${s.join(", ")} back in spec` : "twin running nominally");
+        setVerifyState("verified");
+        verifyRef.current = null;
+      }
+    }
   }
 
   // ── UI actions ───────────────────────────────────────────────────────────
@@ -447,6 +530,8 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
     const next = activeFailures.includes(id) ? activeFailures.filter((f) => f !== id) : [...activeFailures, id];
     setActiveFailures(next);
     failuresRef.current = next;
+    verifyRef.current = null;
+    setVerifyState("idle");
     const failure = model.failures.find((f) => f.id === id);
     if (failure?.controllerFlag && controllerRef.current) {
       // Live toggle — no rebuild needed.
@@ -457,7 +542,29 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
   }
 
   function handleReset() {
+    verifyRef.current = null;
+    setVerifyState("idle");
     buildModel(model, failuresRef.current, true);
+  }
+
+  /** Apply the recommended fix in the twin (clear the injected fault, restart
+   *  clean) and watch the breached telemetry recover — a closed verification. */
+  function verifyFix() {
+    const c = ctx();
+    const meta = metaRef.current;
+    if (!c) return;
+    const controller = controllerRef.current;
+    const ctel = controller ? controller.telemetry(c) : {};
+    const symptoms = meta.telemetry
+      .filter((ch) => ch.nominal && (() => { const v = readChannel(ch, c.data, ctel); return v < ch.nominal![0] || v > ch.nominal![1]; })())
+      .map((ch) => ch.label);
+    verifyRef.current = { symptoms, ticks: 0 };
+    setActiveFailures([]);
+    failuresRef.current = [];
+    if (controllerRef.current) controllerRef.current.flags = new Set();
+    setVerifyState("verifying");
+    setVerifyMsg("");
+    buildModel(meta, [], true); // restart the twin clean (fault removed)
   }
 
   function toggleRun() {
@@ -485,6 +592,9 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
       ({ ch, v }) => `${stamp} TWIN ${ch.label.replace(/[^A-Za-z0-9]+/g, "_")}=${v.toFixed(2)}${ch.unit} OUT_OF_SPEC`,
     );
     const safetyBreach = faults.some((f) => f.id === "overreach");
+    // Hidden ground truth — what the twin actually injected, used only to score the
+    // agents' diagnosis afterwards. Never goes into the agent prompts.
+    const groundTruth = faults.map((f) => f.groundTruth).filter(Boolean).join(" ");
     const notes = faults.map((f) => `Digital-twin reproduction on ${meta.robot}: ${f.label} — ${f.description}`).join("\n");
     const event: TimelineEvent = {
       timestamp: stamp,
@@ -501,7 +611,10 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
       logs: [incident.logs.trim(), ...faultLines, ...obsLines].filter(Boolean).join("\n"),
       maintenanceNotes: [incident.maintenanceNotes.trim(), notes].filter(Boolean).join("\n"),
       timestampedEvents: [...incident.timestampedEvents, event],
+      expectedRootCause: groundTruth || incident.expectedRootCause,
+      hiddenGroundTruth: groundTruth || incident.hiddenGroundTruth,
     });
+    onFaultsCaptured?.(faults.map((f) => f.id));
     setCaptured(true);
     window.setTimeout(() => setCaptured(false), 2200);
   }
@@ -518,6 +631,31 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
     }
   }
 
+  const hasActiveFault = activeFailures.length > 0;
+  const selectedFailureLabels = model.failures.filter((f) => activeFailures.includes(f.id)).map((f) => f.label);
+  const outOfSpecCount = model.telemetry.reduce((count, channel, index) => {
+    const value = telemetry[index] ?? 0;
+    return count + (channel.nominal && (value < channel.nominal[0] || value > channel.nominal[1]) ? 1 : 0);
+  }, 0);
+  const simStatusTone = status === "ready" ? "good" : status === "error" ? "bad" : "warn";
+  const flowRows = [
+    {
+      title: "Inject a fault",
+      caption: hasActiveFault ? selectedFailureLabels.join(", ") : "Pick one failure mode to reproduce.",
+      state: hasActiveFault ? "complete" : "active",
+    },
+    {
+      title: "Capture evidence",
+      caption: hasCapturedEvidence ? "Telemetry and event log are attached." : hasActiveFault ? "Save the current twin state as incident evidence." : "Available after a fault is active.",
+      state: hasCapturedEvidence ? "complete" : hasActiveFault ? "active" : "idle",
+    },
+    {
+      title: "Run investigation",
+      caption: hasCapturedEvidence ? "Send the case to the agent team." : "Unlocked after evidence capture.",
+      state: hasCapturedEvidence ? "active" : "idle",
+    },
+  ] satisfies { title: string; caption: string; state: "complete" | "active" | "idle" }[];
+
   return (
     <Panel
       title="Live physics simulation"
@@ -532,34 +670,47 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
         </span>
       }
     >
-      {SIM_MODELS.length > 1 ? (
-        <div className="flex flex-wrap items-center gap-2 border-b border-slate-100 px-5 py-3">
-          {SIM_MODELS.map((m) => {
-            const active = m.id === selectedId;
-            return (
-              <button
-                key={m.id}
-                type="button"
-                onClick={() => setSelectedId(m.id)}
-                className={`rounded-lg px-3 py-1.5 text-[13px] font-medium transition-colors ${
-                  active ? "bg-brand-600 text-white shadow-sm" : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
-                }`}
-              >
-                {m.label}
-              </button>
-            );
-          })}
+      <div className="border-b border-slate-100 px-5 py-4">
+        <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[11px] font-semibold uppercase tracking-label text-brand-700">{model.robot}</span>
+              <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-label text-slate-500">{model.tagline}</span>
+            </div>
+            <h3 className="mt-1 text-base font-semibold text-slate-950">{model.label}</h3>
+            <p className="mt-1 max-w-3xl text-[13px] leading-6 text-slate-500">{model.description}</p>
+          </div>
+          <div className="flex flex-wrap gap-2 lg:justify-end">
+            <SimStatusPill label="Sim" value={status} tone={simStatusTone} />
+            <SimStatusPill label="Evidence" value={hasCapturedEvidence ? "captured" : "needed"} tone={hasCapturedEvidence ? "good" : "warn"} />
+            <SimStatusPill label="Faults" value={`${activeFailures.length}`} tone={activeFailures.length ? "warn" : "neutral"} />
+          </div>
         </div>
-      ) : null}
 
-      <div className="flex flex-wrap items-baseline gap-x-2 px-5 pt-4">
-        <span className="text-[11px] font-semibold uppercase tracking-label text-brand-600">{model.robot}</span>
+        {SIM_MODELS.length > 1 ? (
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            {SIM_MODELS.map((m) => {
+              const active = m.id === selectedId;
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => setSelectedId(m.id)}
+                  className={`rounded-lg px-3 py-1.5 text-[13px] font-medium transition-colors ${
+                    active ? "bg-brand-600 text-white shadow-sm" : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                  }`}
+                >
+                  {m.label}
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
       </div>
-      <p className="px-5 pt-1 text-[13px] leading-6 text-slate-500">{model.description}</p>
 
       <div className="grid gap-5 p-5 lg:grid-cols-[minmax(0,1fr)_300px]">
         <div className="min-w-0">
-          <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-gradient-to-b from-slate-50 to-white">
+          <div className="relative overflow-hidden rounded-lg border border-slate-200 bg-gradient-to-b from-slate-50 to-white">
             <div ref={mountRef} className="h-[320px] w-full sm:h-[460px]" />
 
             {status !== "ready" ? (
@@ -654,30 +805,15 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
         </div>
 
         <div className="min-w-0 space-y-4">
-          <div>
-            <div className="mb-2 flex items-center gap-1.5">
-              <Activity className="h-3.5 w-3.5 text-brand-600" />
-              <p className="text-[11px] font-semibold uppercase tracking-label text-slate-400">Live state</p>
+          <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3.5">
+            <div className="flex items-center gap-1.5">
+              <FileText className="h-3.5 w-3.5 text-brand-600" />
+              <p className="text-[11px] font-semibold uppercase tracking-label text-slate-500">Investigation flow</p>
             </div>
-            <div className="space-y-1.5">
-              {model.telemetry.map((t, i) => {
-                const value = telemetry[i] ?? 0;
-                const outOfSpec = t.nominal ? value < t.nominal[0] || value > t.nominal[1] : false;
-                return (
-                  <div
-                    key={t.label}
-                    className={`flex items-center justify-between rounded-lg border px-3 py-2 ${
-                      outOfSpec ? "border-red-200 bg-red-50/70" : "border-slate-200 bg-slate-50/60"
-                    }`}
-                  >
-                    <span className="text-xs text-slate-600">{t.label}</span>
-                    <span className={`font-mono text-[13px] font-medium tabular-nums ${outOfSpec ? "text-red-600" : "text-slate-900"}`}>
-                      {value.toFixed(2)}
-                      {t.unit ? <span className="ml-1 text-[10px] font-normal text-slate-400">{t.unit}</span> : null}
-                    </span>
-                  </div>
-                );
-              })}
+            <div className="mt-3 space-y-3">
+              {flowRows.map((row, index) => (
+                <FlowRow key={row.title} index={index + 1} title={row.title} caption={row.caption} state={row.state} />
+              ))}
             </div>
           </div>
 
@@ -695,6 +831,7 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
                     type="button"
                     onClick={() => toggleFailure(f.id)}
                     disabled={status !== "ready"}
+                    aria-pressed={on}
                     className={`w-full rounded-lg border px-3 py-2.5 text-left transition-colors disabled:opacity-40 ${
                       on ? "border-amber-300 bg-amber-50" : "border-slate-200 bg-white hover:bg-slate-50"
                     }`}
@@ -713,29 +850,89 @@ export function MujocoSimulation({ incident, onEvidenceChange, onRunInvestigatio
 
             {onEvidenceChange ? (
               <div className="mt-3 space-y-2">
-                <button
+                <Button
                   type="button"
+                  variant="primary"
                   onClick={captureEvidence}
                   disabled={status !== "ready" || !activeFailures.length}
-                  className="w-full rounded-lg bg-brand-600 px-3 py-2 text-[13px] font-medium text-white shadow-sm transition-colors hover:bg-brand-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+                  className="w-full"
                   title={activeFailures.length ? "Send this reproduced fault into the investigation" : "Inject a fault first"}
                 >
-                  {captured ? "Captured to incident evidence" : "Capture to incident evidence"}
-                </button>
+                  {captured ? <CheckCircle2 className="h-4 w-4" /> : <FileText className="h-4 w-4" />}
+                  {captured ? "Evidence captured" : hasCapturedEvidence ? "Update evidence" : "Capture evidence"}
+                </Button>
                 {onRunInvestigation ? (
-                  <button
+                  <Button
                     type="button"
+                    variant="secondary"
                     onClick={() => void onRunInvestigation()}
                     disabled={status !== "ready" || !hasCapturedEvidence}
-                    className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[13px] font-medium text-slate-700 shadow-sm transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+                    className="w-full"
                     title={hasCapturedEvidence ? "Run the investigation" : "Capture evidence first"}
                   >
                     <Play className="h-3.5 w-3.5" />
                     Run investigation
-                  </button>
+                  </Button>
                 ) : null}
               </div>
             ) : null}
+
+            {/* Closed-loop fix verification — driven from the verdict after analysis. */}
+            {verifyState !== "idle" ? (
+              <div className="mt-3 border-t border-slate-100 pt-3">
+                {verifyState === "verifying" ? (
+                  <p className="flex items-center gap-1.5 text-[11px] text-slate-600">
+                    <span className="h-3 w-3 animate-spin rounded-full border-2 border-slate-300 border-t-emerald-500" />
+                    Applying the recommended fix — verifying the twin recovers…
+                  </p>
+                ) : (
+                  <p className="flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-medium text-emerald-700">
+                    <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+                    Fix verified in twin — {verifyMsg}.
+                  </p>
+                )}
+              </div>
+            ) : null}
+          </div>
+
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5">
+                <Activity className="h-3.5 w-3.5 text-brand-600" />
+                <p className="text-[11px] font-semibold uppercase tracking-label text-slate-400">Live state</p>
+              </div>
+              <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${outOfSpecCount ? "bg-red-50 text-red-700" : "bg-emerald-50 text-emerald-700"}`}>
+                {outOfSpecCount ? `${outOfSpecCount} out of spec` : "nominal"}
+              </span>
+            </div>
+            <div className="space-y-1.5">
+              {model.telemetry.map((t, i) => {
+                const value = telemetry[i] ?? 0;
+                const outOfSpec = t.nominal ? value < t.nominal[0] || value > t.nominal[1] : false;
+                return (
+                  <div
+                    key={t.label}
+                    className={`flex items-center justify-between gap-3 rounded-lg border px-3 py-2 ${
+                      outOfSpec ? "border-red-200 bg-red-50/70" : "border-slate-200 bg-slate-50/60"
+                    }`}
+                  >
+                    <span className="min-w-0">
+                      <span className="block text-xs text-slate-600">{t.label}</span>
+                      {t.nominal ? (
+                        <span className="mt-0.5 block font-mono text-[10px] tabular-nums text-slate-400">
+                          nominal {t.nominal[0]}-{t.nominal[1]}
+                          {t.unit}
+                        </span>
+                      ) : null}
+                    </span>
+                    <span className={`shrink-0 font-mono text-[13px] font-medium tabular-nums ${outOfSpec ? "text-red-600" : "text-slate-900"}`}>
+                      {value.toFixed(2)}
+                      {t.unit ? <span className="ml-1 text-[10px] font-normal text-slate-400">{t.unit}</span> : null}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </div>
       </div>

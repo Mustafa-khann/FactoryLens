@@ -74,10 +74,12 @@ async function main() {
     if (model.makeController) {
       // Drive the real controller; check nominal + each flag fault.
       const scenarios: { label: string; flags: string[]; expect: (t: Record<string, number>) => boolean; note: string }[] = [
-        { label: "nominal", flags: [], expect: (t) => t.binned >= 1, note: "bins ≥1 part" },
-        { label: "belt-jam", flags: ["belt-jam"], expect: (t) => t.binned <= 1 && t.belt_current > 4, note: "throughput stalls, drive current spikes" },
-        { label: "grasp-slip", flags: ["grasp-slip"], expect: (t) => t.binned === 0, note: "no parts picked" },
+        { label: "nominal", flags: [], expect: (t) => t.total_picked >= 1 && t.mishandled === 0, note: "bins parts, none mishandled" },
+        { label: "belt-jam", flags: ["belt-jam"], expect: (t) => t.total_picked <= 1 && t.belt_current > 4, note: "throughput stalls, drive current spikes" },
+        { label: "grasp-slip", flags: ["grasp-slip"], expect: (t) => t.total_picked === 0, note: "no parts picked" },
         { label: "overreach", flags: ["overreach"], expect: (t) => t.minSafety < 0.15, note: "safety breach (<0.15 m)" },
+        { label: "grip-drop", flags: ["grip-drop"], expect: (t) => t.mishandled > 0 && t.total_picked === 0, note: "parts dropped in transit" },
+        { label: "place-miscal", flags: ["place-miscal"], expect: (t) => t.mishandled > 0 && t.total_picked === 0, note: "parts miss the bin" },
       ];
       for (const sc of scenarios) {
         const { m, d } = load(model);
@@ -91,7 +93,9 @@ async function main() {
         }
         const tel = { ...ctrl.telemetry({ mod, model: m, data: d }), minSafety };
         const ok = sc.expect(tel) && !Number.isNaN(d.qpos[0]);
-        console.log(`  ${ok ? "✓" : "✗"} ${sc.label}: binned=${tel.binned} minSafety=${minSafety.toFixed(3)} drive=${tel.belt_current.toFixed(1)}A — ${sc.note}`);
+        console.log(
+          `  ${ok ? "✓" : "✗"} ${sc.label}: picked=${tel.total_picked} mishandled=${tel.mishandled} minSafety=${minSafety.toFixed(3)} drive=${tel.belt_current.toFixed(1)}A — ${sc.note}`,
+        );
         if (!ok) problems++;
         d.delete();
         m.delete();

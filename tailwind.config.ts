@@ -11,12 +11,12 @@ const config: Config = {
       colors: {
         // Brand accent — used sparingly for primary actions and active state.
         brand: {
-          50: "#eef2ff",
-          100: "#e0e7ff",
-          200: "#c7d2fe",
-          500: "#6366f1",
-          600: "#4f46e5",
-          700: "#4338ca",
+          50: "#ecfeff",
+          100: "#cffafe",
+          200: "#a5f3fc",
+          500: "#06b6d4",
+          600: "#0891b2",
+          700: "#0e7490",
         },
       },
       fontFamily: {

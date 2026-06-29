@@ -53,6 +53,9 @@ export interface FailureMode {
   apply?: (model: MjModelHandle) => void;
   /** …or set a flag the live controller reacts to (no rebuild). */
   controllerFlag?: boolean;
+  /** The true root cause this fault represents — hidden ground truth used to
+   *  score the agents' diagnosis after a run. */
+  groundTruth?: string;
 }
 
 export interface CellContext {
@@ -131,6 +134,9 @@ const PHASE_ORDER = ["home", "reach", "lift", "transfer", "place"];
 const PHASE_DWELL = 1.0; // seconds per phase
 // Validated bias (joints 1-3) that drives the flange into the human keep-out zone.
 const OVERREACH_BIAS = [0.3, 0.2, -0.4, 0, 0, 0];
+// Bias applied during the place phase: shortens the reach so parts release short
+// of the bin and land on the open floor in front of it (validated: never in-bin).
+const MISCAL_BIAS = [0, -0.7, 0.7, 0, 0, 0];
 
 // Seven parts queued along the belt; part2 and part5 are genuinely defective.
 const PART_COUNT = 7;
@@ -155,6 +161,7 @@ function makeCellController(): SimController {
   let placed = new Set<number>();
   let totalBinned = 0;
   let defectsBinned = 0;
+  let mishandled = 0; // parts dropped/misplaced this batch (not in the bin)
   let elapsed = 0;
   let siteId = 0;
   let beltSpeed = 0.05;
@@ -195,6 +202,7 @@ function makeCellController(): SimController {
       placed = new Set();
       totalBinned = 0;
       defectsBinned = 0;
+      mishandled = 0;
       elapsed = 0;
       siteId = ctx.mod.mj_name2id(ctx.model, 6, "attachment_site");
       if (siteId < 0) siteId = 0;
@@ -211,7 +219,10 @@ function makeCellController(): SimController {
       const phase = PHASE_ORDER[phaseIdx];
       const set = PHASE_SETPOINTS[phase];
       const overreach = this.flags.has("overreach") && (phase === "transfer" || phase === "place");
-      for (let k = 0; k < 6; k++) data.ctrl[k] = set[k] + (overreach ? OVERREACH_BIAS[k] : 0);
+      const miscal = this.flags.has("place-miscal") && phase === "place";
+      for (let k = 0; k < 6; k++) {
+        data.ctrl[k] = set[k] + (overreach ? OVERREACH_BIAS[k] : 0) + (miscal ? MISCAL_BIAS[k] : 0);
+      }
 
       // Belt feed: each waiting part advances toward the pick point but keeps a
       // minimum gap behind the part ahead of it, so they queue rather than stack.
@@ -253,13 +264,14 @@ function makeCellController(): SimController {
         for (let k = 0; k < 6; k++) data.qvel[dv + k] = 0;
       }
 
-      // Once the whole batch is binned, hold briefly then recycle a fresh batch.
+      // Once every part has been dealt with (binned or mishandled), recycle a batch.
       if (placed.size >= PART_COUNT) {
         resetTimer += dt;
         if (resetTimer >= BATCH_RESET_DWELL) {
           for (let i = 0; i < PART_COUNT; i++) spawnPart(data, i, PART_START_X[i]);
           placed = new Set();
           held = null;
+          mishandled = 0;
           resetTimer = 0;
           batch++;
         }
@@ -281,10 +293,19 @@ function makeCellController(): SimController {
             }
           }
           if (best !== null) held = best;
+        } else if (phase === "lift" && held !== null && this.flags.has("grip-drop")) {
+          // Clamp force lost mid-transfer — the part falls before reaching the bin.
+          placed.add(held);
+          mishandled++;
+          held = null;
         } else if (phase === "place" && held !== null) {
           placed.add(held);
-          totalBinned++;
-          if (DEFECTIVE.has(held)) defectsBinned++;
+          if (this.flags.has("place-miscal")) {
+            mishandled++; // released short of the bin, onto the floor
+          } else {
+            totalBinned++;
+            if (DEFECTIVE.has(held)) defectsBinned++;
+          }
           held = null;
         }
         phaseIdx++;
@@ -311,14 +332,16 @@ function makeCellController(): SimController {
       const dSafe = Math.hypot(f[0] - SAFETY[0], f[1] - SAFETY[1]);
       const jammed = this.flags.has("belt-jam");
       let onBelt = 0;
-      for (let i = 0; i < PART_COUNT; i++) if (isWaiting(i)) onBelt++;
+      for (let i = 0; i < PART_COUNT; i++) {
+        if (isWaiting(i) && Math.abs(ctx.data.qpos[partQadr(i) + 1] - BELT_Y) < 0.12) onBelt++;
+      }
       return {
         safety_dist: dSafe,
         belt_speed: jammed ? 0 : beltSpeed,
         belt_current: jammed ? 5.2 : 1.8 + beltSpeed * 4, // drive current spikes on a jam
-        binned: placed.size, // currently sitting in the bin (this batch)
-        total_picked: totalBinned, // cumulative across batches
+        total_picked: totalBinned, // cumulative parts binned across batches
         defects: defectsBinned, // defective parts handled
+        mishandled, // parts dropped / missed the bin this batch
         on_belt: onBelt, // parts still queued on the conveyor
         throughput: elapsed > 1 ? (totalBinned / elapsed) * 60 : 0, // parts / minute
       };
@@ -345,8 +368,8 @@ const ur5eCell: SimModel = {
     { source: "controller", key: "belt_current", label: "Conveyor drive current", unit: "A", nominal: [0, 3] },
     { source: "controller", key: "throughput", label: "Throughput", unit: "/min" },
     { source: "controller", key: "total_picked", label: "Parts processed", unit: "" },
+    { source: "controller", key: "mishandled", label: "Parts mishandled", unit: "", nominal: [0, 0.9] },
     { source: "controller", key: "on_belt", label: "Parts on belt", unit: "" },
-    { source: "controller", key: "defects", label: "Defective handled", unit: "" },
     { source: "actuator_force", index: 1, label: "Shoulder-lift torque", unit: "N·m", nominal: [-120, 120] },
   ],
   failures: [
@@ -355,18 +378,35 @@ const ur5eCell: SimModel = {
       label: "Conveyor jam",
       description: "The belt seizes — parts stop indexing to the pick point and drive current spikes. Throughput collapses after the part already at the pick.",
       controllerFlag: true,
+      groundTruth: "Conveyor drive jam — the belt stalled, so parts stopped reaching the pick point and throughput collapsed.",
     },
     {
       id: "grasp-slip",
       label: "Grasp failure",
       description: "The gripper fails to close on the part — the arm runs the full cycle but picks nothing, leaving parts stranded on the belt.",
       controllerFlag: true,
+      groundTruth: "Gripper grasp failure — the jaws never closed on the part, so the arm cycled but picked nothing.",
     },
     {
       id: "overreach",
       label: "Collision-risk overreach",
       description: "A miscalibrated place pose swings the flange into the human keep-out zone — the safety distance drops below its limit.",
       controllerFlag: true,
+      groundTruth: "Miscalibrated place pose drove the flange into the human keep-out zone, breaching the safety distance.",
+    },
+    {
+      id: "grip-drop",
+      label: "Clamp-force loss in transit",
+      description: "The gripper loses clamp force mid-transfer — it picks the part but drops it before reaching the bin, so it ends up on the floor.",
+      controllerFlag: true,
+      groundTruth: "Gripper clamp-force loss — parts were picked but dropped in transit before reaching the bin.",
+    },
+    {
+      id: "place-miscal",
+      label: "Place miscalibration",
+      description: "The place pose is calibrated short of the bin — parts are released over the floor and miss the bin entirely.",
+      controllerFlag: true,
+      groundTruth: "Place-pose calibration drift — parts were released short of the bin and missed it, landing on the floor.",
     },
   ],
   makeController: makeCellController,

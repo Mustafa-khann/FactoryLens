@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
+  ArrowRight,
   Bot,
   Boxes,
   CheckCircle2,
@@ -77,6 +78,27 @@ const EMPTY_INCIDENT: Incident = {
 function formatMs(ms: number) {
   if (!ms) return "0.0s";
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+const GROUND_TRUTH_STOPWORDS = new Set([
+  "the", "and", "into", "its", "with", "that", "caused", "cause", "root", "robot", "parts", "part",
+  "were", "was", "drove", "drop", "dropped", "short", "before", "after", "reaching", "stopped", "point",
+]);
+
+/** Lenient token-overlap match between the twin's hidden ground truth and the
+ *  agents' verdict — true when they name the same failure. Returns null if either
+ *  side is missing (no ground truth to score against). */
+function diagnosisMatchesGroundTruth(expected: string | undefined, diagnosis: string): boolean | null {
+  if (!expected || !diagnosis.trim()) return null;
+  const tokens = (s: string) =>
+    new Set(
+      s.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter((w) => w.length > 3 && !GROUND_TRUTH_STOPWORDS.has(w)),
+    );
+  const expectedTokens = [...tokens(expected)];
+  if (!expectedTokens.length) return null;
+  const diagnosisTokens = tokens(diagnosis);
+  const hits = expectedTokens.filter((w) => diagnosisTokens.has(w)).length;
+  return hits >= 3 || hits / expectedTokens.length >= 0.4;
 }
 
 function MissingDataPanel({ requests }: { requests: MissingDataRequest[] }) {
@@ -206,7 +228,59 @@ function StageLine({ icon, title, caption, active }: { icon: ReactNode; title: s
   );
 }
 
+type WorkflowState = "complete" | "active" | "idle";
+
+function WorkflowStep({
+  icon,
+  title,
+  caption,
+  state,
+}: {
+  icon: ReactNode;
+  title: string;
+  caption: string;
+  state: WorkflowState;
+}) {
+  const stateClass =
+    state === "complete"
+      ? "border-emerald-200 bg-emerald-50/75"
+      : state === "active"
+        ? "border-cyan-200 bg-cyan-50/85"
+        : "border-slate-200 bg-white";
+  const iconClass =
+    state === "complete"
+      ? "bg-emerald-600 text-white"
+      : state === "active"
+        ? "bg-cyan-700 text-white"
+        : "bg-slate-100 text-slate-500";
+
+  return (
+    <div className={`flex items-start gap-3 rounded-lg border px-3 py-3 ${stateClass}`}>
+      <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${iconClass}`}>
+        {state === "complete" ? <CheckCircle2 className="h-4 w-4" /> : icon}
+      </span>
+      <div className="min-w-0">
+        <div className="flex items-center gap-2">
+          <p className="text-[13px] font-semibold text-slate-950">{title}</p>
+          {state === "active" ? <span className="h-1.5 w-1.5 rounded-full bg-cyan-600" /> : null}
+        </div>
+        <p className="mt-0.5 text-xs leading-5 text-slate-500">{caption}</p>
+      </div>
+    </div>
+  );
+}
+
 function SourceEventList({ incident }: { incident: Incident }) {
+  if (!incident.timestampedEvents.length) {
+    return (
+      <div className="p-5">
+        <EmptyState icon={<Clock className="h-4 w-4" />} title="No twin events captured">
+          Reproduce a failure in the Simulation tab, then capture it to create the source timeline.
+        </EmptyState>
+      </div>
+    );
+  }
+
   return (
     <div className="divide-y divide-slate-100">
       {incident.timestampedEvents.slice(0, 5).map((event) => (
@@ -224,6 +298,9 @@ export default function Home() {
   const [incident, setIncident] = useState<Incident>(EMPTY_INCIDENT);
   // True once the twin has captured evidence into the incident — gates the run.
   const [hasEvidence, setHasEvidence] = useState(false);
+  // Fault ids captured from the twin (so the verdict can verify the recommended fix).
+  const [capturedFaultIds, setCapturedFaultIds] = useState<string[]>([]);
+  const [verifyNonce, setVerifyNonce] = useState(0);
   const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [speedDemo, setSpeedDemo] = useState<AnalysisResponse | null>(null);
   const [speedDemoLoading, setSpeedDemoLoading] = useState(false);
@@ -432,9 +509,82 @@ export default function Home() {
   const completedAgents = agents.filter((agent) => agent.status === "complete").length;
   const criticalSafetyCount = activeSafetyWarnings.filter((warning) => warning.severity === "critical").length;
   const sourceEventCount = activeTimeline.length || incident.timestampedEvents.length;
-  const runState = loading ? "Investigating" : finalReport ? "Decision ready" : "Simulation armed";
+  const runState = loading ? "Investigating" : finalReport ? "Decision ready" : hasEvidence ? "Ready to run" : "Capture needed";
   const speedValue = pipeline?.tokensPerSecond ? `${Math.round(pipeline.tokensPerSecond).toLocaleString()} tok/s` : speedup ? `${speedup.toFixed(0)}x` : "Ready";
-  const rootCause = finalReport?.mostLikelyRootCause ?? incident.expectedRootCause ?? "Awaiting agent verdict";
+  const rootCause = finalReport?.mostLikelyRootCause ?? (hasEvidence ? "Awaiting agent verdict" : "No case captured yet");
+  // Score the agents' verdict against the twin's hidden ground truth (when known).
+  const groundTruthMatch = finalReport
+    ? diagnosisMatchesGroundTruth(incident.expectedRootCause, `${finalReport.mostLikelyRootCause ?? ""} ${activeHypotheses[0]?.hypothesis ?? ""}`)
+    : null;
+  const workflowBadge = loading ? "running" : finalReport ? "ready" : hasEvidence ? "armed" : "setup";
+  const workflowSteps: { icon: ReactNode; title: string; caption: string; state: WorkflowState }[] = [
+    {
+      icon: <Boxes className="h-4 w-4" />,
+      title: "Reproduce",
+      caption: "Inject a physical fault in the twin.",
+      state: hasEvidence ? "complete" : "active",
+    },
+    {
+      icon: <FileText className="h-4 w-4" />,
+      title: "Capture",
+      caption: "Turn twin telemetry into case evidence.",
+      state: hasEvidence ? "complete" : "idle",
+    },
+    {
+      icon: <Users className="h-4 w-4" />,
+      title: "Investigate",
+      caption: "Specialists debate the root cause.",
+      state: loading ? "active" : finalReport ? "complete" : hasEvidence ? "active" : "idle",
+    },
+    {
+      icon: <ShieldCheck className="h-4 w-4" />,
+      title: "Decide",
+      caption: "Review repair, safety, and verification.",
+      state: finalReport ? "complete" : "idle",
+    },
+  ];
+  const nextAction = !hasEvidence
+    ? {
+        label: "Open simulation",
+        description: "Start by injecting a fault and capturing the evidence packet.",
+        icon: <Boxes className="h-4 w-4" />,
+        onClick: () => setActiveTab("simulation"),
+        primary: true,
+      }
+    : loading
+      ? {
+          label: "Watch agents",
+          description: "The investigation is running. Follow the specialist handoff in real time.",
+          icon: <Users className="h-4 w-4" />,
+          onClick: () => setActiveTab("agents"),
+          primary: false,
+        }
+      : finalReport && capturedFaultIds.length
+        ? {
+            label: "Verify fix in twin",
+            description: "Replay the captured fault, apply the repair, and confirm telemetry returns to spec.",
+            icon: <ShieldCheck className="h-4 w-4" />,
+            onClick: () => {
+              setVerifyNonce((n) => n + 1);
+              setActiveTab("simulation");
+            },
+            primary: true,
+          }
+        : finalReport
+          ? {
+              label: "Review report",
+              description: "The verdict is ready with evidence, repair steps, and escalation criteria.",
+              icon: <LayoutDashboard className="h-4 w-4" />,
+              onClick: () => setActiveTab("overview"),
+              primary: false,
+            }
+          : {
+              label: demoMode ? "Run demo investigation" : "Run live investigation",
+              description: "Evidence is captured. Start the multi-agent diagnosis.",
+              icon: <Play className="h-4 w-4" />,
+              onClick: () => void runInvestigation(),
+              primary: true,
+            };
 
   const tabs: { id: TabId; label: string; icon: ReactNode; count?: number }[] = [
     { id: "simulation", label: "Simulation", icon: <Boxes className="h-4 w-4" /> },
@@ -491,12 +641,15 @@ export default function Home() {
               type="button"
               variant="primary"
               size="lg"
-              onClick={runInvestigation}
-              disabled={loading || !hasEvidence}
+              onClick={() => {
+                if (hasEvidence) void runInvestigation();
+                else setActiveTab("simulation");
+              }}
+              disabled={loading}
               title={hasEvidence ? undefined : "Reproduce and capture a fault in the Simulation tab first."}
             >
-              {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-              {loading ? "Investigating..." : demoMode ? "Run demo" : "Run live"}
+              {loading ? <RefreshCw className="h-4 w-4 animate-spin" /> : hasEvidence ? <Play className="h-4 w-4" /> : <Boxes className="h-4 w-4" />}
+              {loading ? "Investigating..." : hasEvidence ? (demoMode ? "Run demo" : "Run live") : "Capture evidence"}
             </Button>
           </div>
         </div>
@@ -517,17 +670,31 @@ export default function Home() {
                   <p className="text-xs font-semibold uppercase tracking-label text-cyan-200">Incident command surface</p>
                   <h2 className="mt-2 max-w-4xl text-2xl font-semibold leading-tight text-white sm:text-3xl">{incident.incidentTitle}</h2>
                   <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-300">
-                    {incident.machineType} investigation with live fault injection, evidence replay, adversarial hypotheses, and a safety-aware repair call.
+                    {hasEvidence
+                      ? `${incident.machineType} investigation with live fault injection, evidence replay, adversarial hypotheses, and a safety-aware repair call.`
+                      : "Capture a MuJoCo twin fault to unlock agent analysis, evidence replay, hypotheses, and a safety-aware repair call."}
                   </p>
                 </div>
                 <div className="rounded-lg border border-white/10 bg-white/[0.07] p-3">
-                  <p className="text-[11px] font-semibold uppercase tracking-label text-slate-400">Current verdict</p>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[11px] font-semibold uppercase tracking-label text-slate-400">Current verdict</p>
+                    {groundTruthMatch !== null ? (
+                      <span
+                        className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-semibold ${
+                          groundTruthMatch ? "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-400/30" : "bg-amber-500/15 text-amber-300 ring-1 ring-amber-400/30"
+                        }`}
+                        title={`Hidden ground truth from the twin: ${incident.expectedRootCause}`}
+                      >
+                        {groundTruthMatch ? "✓ Matched injected fault" : "≠ Diverged from injected fault"}
+                      </span>
+                    ) : null}
+                  </div>
                   <p className="mt-1 line-clamp-3 text-sm font-semibold leading-5 text-white">{rootCause}</p>
                 </div>
               </div>
 
               <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                <HeroMetric icon={<ShieldAlert className="h-4 w-4" />} label="Severity" value={incident.severity} />
+                <HeroMetric icon={<ShieldAlert className="h-4 w-4" />} label="Severity" value={hasEvidence ? incident.severity : "none"} />
                 <HeroMetric icon={<Clock className="h-4 w-4" />} label="Events" value={`${sourceEventCount}`} />
                 <HeroMetric icon={<Network className="h-4 w-4" />} label="Evidence graph" value={`${activeGraph.nodes.length || 0} nodes`} />
                 <HeroMetric icon={<Zap className="h-4 w-4" />} label="Latency proof" value={speedup ? `${speedup.toFixed(0)}x faster` : formatMs(elapsedMs)} />
@@ -535,11 +702,32 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="grid gap-3 sm:grid-cols-3 xl:grid-cols-1">
-            <StageLine icon={<Boxes className="h-4 w-4" />} title="Digital twin" caption="Real-time MuJoCo scene with injected physical faults." active={activeTab === "simulation"} />
-            <StageLine icon={<Users className="h-4 w-4" />} title="Agent debate" caption="Eight specialists reconstruct, challenge, and converge." active={loading || activeTab === "agents"} />
-            <StageLine icon={<ShieldCheck className="h-4 w-4" />} title="Repair decision" caption="Safety gates, missing data, and next action in one view." active={!!finalReport || activeTab === "overview"} />
-          </div>
+          <aside className="rounded-lg border border-slate-200 bg-white p-4 shadow-card">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-label text-slate-400">Workflow</p>
+                <h3 className="mt-1 text-sm font-semibold text-slate-950">Next best action</h3>
+              </div>
+              <StatusBadge value={workflowBadge} dot />
+            </div>
+
+            <div className="mt-4 space-y-2">
+              {workflowSteps.map((step) => (
+                <WorkflowStep key={step.title} {...step} />
+              ))}
+            </div>
+
+            <div className="mt-4 border-t border-slate-100 pt-4">
+              <p className="text-xs leading-5 text-slate-500">{nextAction.description}</p>
+              <Button type="button" variant={nextAction.primary ? "primary" : "secondary"} className="mt-3 w-full justify-between" onClick={nextAction.onClick}>
+                <span className="inline-flex items-center gap-2">
+                  {nextAction.icon}
+                  {nextAction.label}
+                </span>
+                <ArrowRight className="h-4 w-4 opacity-70" />
+              </Button>
+            </div>
+          </aside>
         </div>
       </section>
 
@@ -584,6 +772,7 @@ export default function Home() {
                     key={tab.id}
                     type="button"
                     onClick={() => setActiveTab(tab.id)}
+                    aria-current={active ? "page" : undefined}
                     className={`inline-flex h-9 items-center gap-2 rounded-md px-3 text-[13px] font-medium transition-colors ${
                       active ? "bg-slate-950 text-white shadow-sm" : "text-slate-600 hover:bg-slate-100 hover:text-slate-950"
                     }`}
@@ -679,12 +868,43 @@ export default function Home() {
                   ) : null}
                   {finalReport && similarMatches.length ? <SimilarIncidents matches={similarMatches} usedInDiagnosis={priorsUsed} /> : null}
                   <FinalReport report={finalReport} />
+                  {finalReport && capturedFaultIds.length ? (
+                    <Panel
+                      title="Verify the fix"
+                      subtitle="Apply the recommended repair back in the digital twin and confirm the fault clears."
+                      icon={<ShieldCheck className="h-4 w-4" />}
+                      accent="ok"
+                    >
+                      <div className="flex flex-wrap items-center gap-3">
+                        <Button
+                          type="button"
+                          variant="primary"
+                          onClick={() => {
+                            setVerifyNonce((n) => n + 1);
+                            setActiveTab("simulation");
+                          }}
+                        >
+                          <ShieldCheck className="h-4 w-4" />
+                          Apply fix &amp; verify in twin
+                        </Button>
+                        <span className="text-xs leading-5 text-slate-500">
+                          Reproduces the diagnosed fault in the twin, applies the fix, and confirms the breached telemetry returns to spec.
+                        </span>
+                      </div>
+                    </Panel>
+                  ) : null}
                 </>
               )
             ) : null}
 
             {activeTab === "simulation" ? (
-              <MujocoSimulation incident={incident} onEvidenceChange={applySimulationEvidence} onRunInvestigation={runInvestigation} />
+              <MujocoSimulation
+                incident={incident}
+                onEvidenceChange={applySimulationEvidence}
+                onRunInvestigation={runInvestigation}
+                onFaultsCaptured={setCapturedFaultIds}
+                verifyRequest={{ nonce: verifyNonce, faults: capturedFaultIds }}
+              />
             ) : null}
             {activeTab === "agents" ? <AgentWarRoom agents={agents} loading={loading} elapsedMs={elapsedMs} mode={analysis?.mode} /> : null}
             {activeTab === "timeline" ? <Timeline events={activeTimeline} /> : null}
