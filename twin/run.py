@@ -61,7 +61,10 @@ def main():
     ap.add_argument("--fault", choices=sorted(FAULTS), help="inject an adversarial fault")
     ap.add_argument("--diagnose", action="store_true", help="run the injected fault through the FactoryLens agents")
     ap.add_argument("--diagnose-all", action="store_true", help="diagnose all four faults and print a scorecard")
-    ap.add_argument("--mode", choices=["live", "demo"], default="live", help="diagnosis mode")
+    ap.add_argument("--recover", action="store_true", help="run the full loop (diagnose + recover + closed-loop score) for --fault")
+    ap.add_argument("--recover-all", action="store_true", help="run the full loop for all four faults and score recoveries")
+    ap.add_argument("--policy", choices=["agent", "oracle"], default="agent", help="recovery action selection")
+    ap.add_argument("--mode", choices=["live", "demo"], default="live", help="diagnosis/recovery mode")
     ap.add_argument("--api", type=str, default=None, help="FactoryLens API base URL (overrides $FACTORYLENS_API)")
     ap.add_argument("--seconds", type=float, default=6.0, help="sim seconds for the nominal run")
     ap.add_argument("--warmup", type=float, default=2.0, help="nominal seconds before injecting the fault")
@@ -76,6 +79,27 @@ def main():
         scores = [_diagnose(fid, args.mode, args.api) for fid in sorted(FAULTS)]
         hits = sum(s.correct for s in scores)
         print(f"\n=== diagnosis scorecard: {hits}/{len(scores)} faults correctly identified ===")
+        return
+
+    if args.recover_all or (args.fault and args.recover):
+        from loop import run_loop
+
+        faults = sorted(FAULTS) if args.recover_all else [args.fault]
+        total = 0.0
+        for fid in faults:
+            r = run_loop(fid, mode=args.mode, policy=args.policy, base_url=args.api, render=bool(args.out))
+            o = r.outcome
+            total += o.score
+            print(f"\n──── {fid.upper()} ────")
+            print(f"  diagnosis   : {r.diagnosed_root_cause[:90]}  [{'✓' if r.diagnosis_correct else '✗'}]")
+            print(f"  recovery    : {o.action_id}  ({r.recovery_rationale[:70]})")
+            print(f"  applied → outcome: success={o.success} safe={o.safety_ok} score={o.score}")
+            print(f"  physical    : {o.detail}")
+            print(f"  ground truth: {r.ground_truth[:90]}")
+            if args.out and o.image is not None:
+                _save_image(o.image, out / f"recovery_{fid}.png")
+        if len(faults) > 1:
+            print(f"\n=== closed-loop recovery score: {total:.1f}/{len(faults)} ===")
         return
 
     if args.fault and args.diagnose:

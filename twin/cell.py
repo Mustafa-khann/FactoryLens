@@ -34,7 +34,8 @@ MODEL_PATH = Path(__file__).parent / "robots" / "ur5e" / "factory_cell.xml"
 BELT_Y = 0.449
 BELT_TOP_Z = 0.05
 PICK = np.array([-0.447, 0.449, 0.085])       # where a part sits ready to be picked
-BIN = np.array([-0.520, -0.365, 0.10])         # drop target (bin centre)
+BIN = np.array([-0.520, -0.365, 0.10])         # good-parts drop target (bin centre)
+QUARANTINE = np.array([-0.150, -0.430, 0.10])  # reject/quarantine drop spot (away from the good bin)
 SAFETY = np.array([-0.52, -0.62, 0.13])        # human keep-out centre (operator unloading the bin)
 SAFETY_RADIUS = 0.15
 PART_HALF = 0.032
@@ -90,6 +91,18 @@ class FactoryCell:
 
     def __init__(self, seed: int = 0):
         self.model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+        # The arm grasps kinematically and never needs contact, so disable collision on the
+        # robot geoms — this frees inverse kinematics to reach contorted recovery poses
+        # without self-collision locking the joints. Parts, belt, bin and floor keep their
+        # collisions so parts still rest, slip, and fall under real physics.
+        _collidable = {"floor", "belt", "belt_rail_n", "belt_rail_f",
+                       "bin_floor", "bin_w1", "bin_w2", "bin_w3", "bin_w4",
+                       "part0_geom", "part1_geom", "part2_geom"}
+        for gid in range(self.model.ngeom):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+            if name not in _collidable:
+                self.model.geom_contype[gid] = 0
+                self.model.geom_conaffinity[gid] = 0
         self.data = mujoco.MjData(self.model)
         self.rng = np.random.default_rng(seed)
         self._renderer: Optional[mujoco.Renderer] = None
@@ -103,6 +116,10 @@ class FactoryCell:
 
         # control bias applied on top of the phase setpoint (used by collision-risk fault)
         self.ctrl_bias = np.zeros(6)
+        # when set, the arm holds this 6-vector and the scripted cycle is suspended (recovery mode)
+        self.manual_target: Optional[np.ndarray] = None
+        # closest gripper approach to the human zone over the current window (recovery scoring)
+        self.min_safety_dist = float("inf")
         # which part the gripper is currently carrying (kinematic grasp)
         self.held_part: Optional[int] = None
         self.next_pick = 0
@@ -159,10 +176,80 @@ class FactoryCell:
         """Let go of the held part — gravity takes over from here."""
         self.held_part = None
 
+    # --- inverse kinematics & recovery primitives --------------------------
+    def _arm_dof(self) -> list:
+        return [self.model.jnt_dofadr[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, n)] for n in JOINT_NAMES]
+
+    def _joint_range(self, name: str):
+        jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        lo, hi = self.model.jnt_range[jid]
+        return (float(lo), float(hi)) if self.model.jnt_limited[jid] else (-6.28, 6.28)
+
+    def solve_ik(self, target_xyz, iters: int = 200, tol: float = 2e-3) -> np.ndarray:
+        """Damped-least-squares IK on the 6 arm joints to put the flange at target_xyz.
+
+        Solved on a scratch MjData copy so it doesn't disturb the live sim; returns a
+        6-vector of joint targets the position actuators can then drive to.
+        """
+        scratch = mujoco.MjData(self.model)
+        q = np.array([self.data.qpos[self._jqadr[n]] for n in JOINT_NAMES])
+        ranges = [self._joint_range(n) for n in JOINT_NAMES]
+        dof = self._arm_dof()
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+        target = np.asarray(target_xyz, dtype=float)
+
+        for _ in range(iters):
+            for n, v in zip(JOINT_NAMES, q):
+                scratch.qpos[self._jqadr[n]] = v
+            mujoco.mj_kinematics(self.model, scratch)
+            mujoco.mj_comPos(self.model, scratch)
+            err = target - scratch.site_xpos[self._site]
+            if np.linalg.norm(err) < tol:
+                break
+            mujoco.mj_jacSite(self.model, scratch, jacp, jacr, self._site)
+            J = jacp[:, dof]
+            dq = J.T @ np.linalg.solve(J @ J.T + 0.04 * np.eye(3), err)
+            q = np.clip(q + np.clip(dq, -0.3, 0.3), [r[0] for r in ranges], [r[1] for r in ranges])
+        return q
+
+    def goto_joints(self, q6, steps: int = 500):
+        """Hold a joint target (manual mode) and step the sim, carrying any held part."""
+        self.manual_target = np.asarray(q6, dtype=float)
+        for _ in range(steps):
+            self.step()
+
+    def goto_xyz(self, target_xyz, steps: int = 500):
+        """Drive the flange to a Cartesian target via IK, on real actuator dynamics."""
+        self.goto_joints(self.solve_ik(target_xyz), steps=steps)
+        return self.flange()
+
+    def grasp(self, part_id: int):
+        """Engage a kinematic grasp on a specific part (used by recovery, outside the cycle)."""
+        self.held_part = part_id
+
+    def stop_belt(self):
+        """De-energise the conveyor drive: belt halts and drive current returns to nominal."""
+        self.belt_speed = 0.0
+        self.belt_jam_current = 0.0
+        self.belt_jammed = False  # drive commanded off; no longer straining
+
+    def resume_belt(self):
+        self.belt_jammed = False
+        self.belt_jam_current = 0.0
+        self.belt_speed = self.belt_speed_nominal
+
     # --- stepping ----------------------------------------------------------
     def step(self):
-        """Advance one physics tick: drive the cycle, move the belt, carry/release parts."""
-        target = np.array(PHASE_SETPOINTS[self.phase]) + self.ctrl_bias
+        """Advance one physics tick: drive the cycle, move the belt, carry/release parts.
+
+        In manual mode (set by recovery primitives) the arm holds `manual_target` and the
+        scripted pick/place cycle is suspended — the recovery controller is in charge.
+        """
+        if self.manual_target is not None:
+            target = np.asarray(self.manual_target, dtype=float)
+        else:
+            target = np.array(PHASE_SETPOINTS[self.phase]) + self.ctrl_bias
         for n, v in zip(ACTUATOR_NAMES, target):
             self.data.ctrl[self._aid[n]] = float(v)
 
@@ -183,7 +270,17 @@ class FactoryCell:
         if self.held_part is not None:
             self._carry_part(self.held_part)
 
-        self._advance_phase()
+        # latch the closest the gripper ever came to the human zone (for recovery scoring)
+        grip = self.flange()
+        d = float(np.linalg.norm(grip - np.array([SAFETY[0], SAFETY[1], grip[2]])))
+        self.min_safety_dist = min(self.min_safety_dist, d)
+
+        if self.manual_target is None:
+            self._advance_phase()
+
+    def reset_safety_monitor(self):
+        """Start a fresh window for tracking the closest approach to the human keep-out zone."""
+        self.min_safety_dist = float("inf")
 
     def _advance_phase(self):
         self.phase_timer += self.model.opt.timestep

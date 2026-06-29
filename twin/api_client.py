@@ -57,3 +57,29 @@ def analyze(
             f"could not reach FactoryLens API at {url} ({exc.reason}). "
             f"Start the app (npm run dev) or set FACTORYLENS_API."
         ) from None
+
+
+def recover(
+    incident_title: str,
+    diagnosis: str,
+    actions: list,
+    base_url: Optional[str] = None,
+    mode: str = "live",
+    timeout: float = 120.0,
+) -> dict:
+    """Ask the Recovery agent to choose one action from `actions` ([{id, description}, ...])."""
+    base = (base_url or os.environ.get("FACTORYLENS_API", "http://localhost:3000")).rstrip("/")
+    url = f"{base}/api/recover"
+    payload = {"incidentTitle": incident_title, "diagnosis": diagnosis, "actions": actions, "mode": mode}
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with _opener_for(url).open(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"recover failed (HTTP {exc.code}): {body[:300]}") from None
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"could not reach FactoryLens API at {url} ({exc.reason}).") from None

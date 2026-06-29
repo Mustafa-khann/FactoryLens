@@ -231,6 +231,43 @@ export function buildVisionMessages(incident: Incident, imageDataUrl: string): C
   ];
 }
 
+/** Recovery — chooses ONE executable action from the cell's action menu to clear the fault. */
+export function buildRecoveryMessages(
+  incidentTitle: string,
+  diagnosis: string,
+  actions: { id: string; description: string }[],
+): ChatMessage[] {
+  const menu = actions.map((a) => `- ${a.id}: ${a.description}`).join("\n");
+  return [
+    {
+      role: "system",
+      content:
+        "You are the FactoryLens Recovery agent for a robotic work cell. Given a diagnosed fault, you choose " +
+        "exactly ONE recovery action from the provided menu and explain why. Safety is the top priority: never " +
+        "choose an action that continues motion toward a hazard or keeps a straining drive energised. Prefer the " +
+        "action that physically clears the fault while protecting people and equipment. Return JSON only.",
+    },
+    {
+      role: "user",
+      content: [
+        `Incident: ${incidentTitle}`,
+        "",
+        "Diagnosed cause (from the investigation):",
+        diagnosis || "(no diagnosis text available)",
+        "",
+        "Available recovery actions (choose exactly one by id):",
+        menu,
+        "",
+        "Return JSON:",
+        "- actionId: the id of the single best recovery action from the menu above.",
+        "- rationale: why this action addresses the diagnosed cause.",
+        "- expectedOutcome: what the cell state should look like after it succeeds.",
+        "- safetyConsiderations: the hazard you are protecting against and how this action avoids it.",
+      ].join("\n"),
+    },
+  ];
+}
+
 /** Skeptic — adversarially reviews the synthesized hypotheses and forces a calibrated revision. */
 export function buildSkepticMessages(incident: Incident, hypotheses: { rank: number; hypothesis: string; confidence: number; evidenceFor: string[]; evidenceAgainst: string[] }[], hasImage: boolean): ChatMessage[] {
   const hypothesisDigest = hypotheses

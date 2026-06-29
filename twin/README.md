@@ -12,8 +12,8 @@ This is the simulation substrate for the **Adversarial Factory Digital Twin** lo
 2. A fault is injected: slip · jam · misclassify · collision  (faults.py)  ✅
 3. Gemma reads the cell state + rendered image         (incident.py)       ✅
 4. Multiple agents diagnose the cause                  (diagnose.py → lib/) ✅
-5. A recovery agent proposes an action                 [next]
-6. The action is applied back in the sim and scored    [next — closed loop]
+5. A recovery agent proposes an action                 (recovery.py → /api/recover)  ✅
+6. The action is applied back in the sim and scored    (recovery.py — closed loop)   ✅
 7. A report agent writes a deployment-readiness note   [next]
 ```
 
@@ -48,9 +48,25 @@ python run.py --fault collision --diagnose          # also run it through the ag
 python run.py --diagnose-all                        # diagnose all four, print a scorecard
 ```
 
-Diagnosis calls `$FACTORYLENS_API` (default `http://localhost:3000`). For a **live**
-diagnosis, run `npm run dev` in the repo root with `CEREBRAS_API_KEY` set. `--mode demo`
-exercises the full pipeline plumbing without a key (returns sample data, not a real call).
+- `recovery.py` — the recovery action space + **closed-loop evaluator**. A chosen action is
+  applied back in the live sim (the arm retrieves a dropped part via IK, the belt drive is
+  cut, a suspect part is moved to quarantine, a breaching path is replanned) and scored on
+  **physics**: did the fault clear, and did the recovery stay clear of the human zone? It
+  refuses to reward a plausible-but-wrong recovery (e.g. re-grasping when the belt is
+  jammed scores 0).
+- `loop.py` — the full loop on one shared sim: run_to_fault → diagnose → recovery agent
+  picks an action (`/api/recover`) → apply & score.
+
+```bash
+python run.py --recover --fault jam        # full loop for one fault
+python run.py --recover-all                # full loop for all four, closed-loop scorecard
+python run.py --recover-all --policy oracle # use the known-correct action (no recovery agent)
+```
+
+Diagnosis and recovery call `$FACTORYLENS_API` (default `http://localhost:3000`). For a
+**live** run, `npm run dev` in the repo root with `CEREBRAS_API_KEY` set. `--mode demo`
+exercises the full plumbing without a key (heuristic agent + sample diagnosis); the
+closed-loop physical scoring is real in both modes.
 
 ## Setup
 

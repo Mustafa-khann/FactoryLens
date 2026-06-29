@@ -231,6 +231,39 @@ class IncidentCapture:
     image: object = None       # np.ndarray RGB frame at manifestation (optional)
 
 
+def run_to_fault(fault_id: str, warmup_s: float = 2.0, max_s: float = 12.0, seed: int = 0):
+    """Run until the fault manifests and return the LIVE cell, fault, and capture (cell stays open).
+
+    Unlike run_scenario, this does not close the cell — the recovery controller continues
+    the very same simulation to apply and score a fix (closed loop).
+    """
+    cell = FactoryCell(seed=seed)
+    fault = make_fault(fault_id)
+    dt = cell.model.opt.timestep
+
+    cell.run(warmup_s)
+    baseline = cell.snapshot()
+    fault.arm(cell)
+    arm_time = float(cell.data.time)
+
+    incident, manifested, detect_time = baseline, False, arm_time
+    for _ in range(int(max_s / dt)):
+        cell.step()
+        state = cell.snapshot()
+        fault.update(cell, state)
+        if fault.manifested(state):
+            incident, manifested, detect_time = state, True, state.t
+            break
+
+    capture = IncidentCapture(
+        fault_id=fault_id, ground_truth=fault.ground_truth(), symptom=fault.symptom(),
+        baseline=baseline, incident=incident, manifested=manifested,
+        arm_time=round(arm_time, 3), detect_time=round(detect_time, 3),
+        timeline=[], image=None,
+    )
+    return cell, fault, capture
+
+
 def run_scenario(
     fault_id: str,
     warmup_s: float = 2.0,
