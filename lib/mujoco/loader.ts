@@ -83,6 +83,61 @@ export interface MjDataHandle {
 }
 
 const MODULE_URL = "/mujoco/mujoco_wasm.js";
+const MODULE_LOAD_TIMEOUT_MS = 45_000;
+const MODEL_ASSET_TIMEOUT_MS = 90_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const id = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(id);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(id);
+        reject(err);
+      },
+    );
+  });
+}
+
+async function assertPublicAsset(url: string, label: string) {
+  const res = await withTimeout(fetch(url, { method: "HEAD", cache: "no-store" }), 10_000, `${label} did not respond at ${url}.`);
+  const contentType = res.headers.get("content-type") ?? "";
+  const contentLength = Number(res.headers.get("content-length") ?? "0");
+
+  if (!res.ok) {
+    throw new Error(`${label} is missing at ${url} (HTTP ${res.status}). Check that public/mujoco is included in the Vercel deployment.`);
+  }
+  if (contentType.includes("text/html")) {
+    throw new Error(`${label} returned the app HTML instead of a static asset. Check that public/mujoco is included in the Vercel deployment.`);
+  }
+  if (contentLength > 0 && contentLength < 1_000_000) {
+    throw new Error(`${label} at ${url} looks too small (${contentLength} bytes). Check the deployed MuJoCo runtime asset.`);
+  }
+}
+
+async function fetchModelAsset(file: VfsFile): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MODEL_ASSET_TIMEOUT_MS);
+  try {
+    const res = await fetch(file.url, { signal: controller.signal });
+    const contentType = res.headers.get("content-type") ?? "";
+    if (!res.ok) throw new Error(`Failed to fetch ${file.url} (HTTP ${res.status}).`);
+    if (contentType.includes("text/html")) {
+      throw new Error(`Model asset ${file.url} returned the app HTML instead of ${file.binary ? "mesh bytes" : "XML"}. Check the Vercel static assets.`);
+    }
+    return res;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error(`Timed out loading model asset ${file.url}.`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 export function loadMujocoModule(): Promise<MujocoModule> {
   if (typeof window === "undefined") {
@@ -94,13 +149,14 @@ export function loadMujocoModule(): Promise<MujocoModule> {
       url: string,
     ) => Promise<{ default?: () => Promise<MujocoModule> }>;
 
-    modulePromise = runtimeImport(MODULE_URL)
+    modulePromise = assertPublicAsset(MODULE_URL, "MuJoCo runtime")
+      .then(() => withTimeout(runtimeImport(MODULE_URL), MODULE_LOAD_TIMEOUT_MS, "Timed out importing the MuJoCo runtime."))
       .then((mod) => {
         const factory = mod.default;
         if (typeof factory !== "function") {
           throw new Error("MuJoCo module did not export a factory function.");
         }
-        return factory();
+        return withTimeout(factory(), MODULE_LOAD_TIMEOUT_MS, "Timed out initializing the MuJoCo physics engine.");
       })
       .catch((err) => {
         modulePromise = null; // allow a later retry instead of caching the failure
@@ -154,8 +210,7 @@ export async function stageAndLoad(mod: MujocoModule, assets: ModelAssets): Prom
     for (const dir of assets.dirs) mkdirp(mod, dir);
     await Promise.all(
       assets.files.map(async (f) => {
-        const res = await fetch(f.url);
-        if (!res.ok) throw new Error(`Failed to fetch ${f.url} (HTTP ${res.status}).`);
+        const res = await fetchModelAsset(f);
         if (f.binary) mod.FS.writeFile(f.path, new Uint8Array(await res.arrayBuffer()));
         else mod.FS.writeFile(f.path, await res.text());
       }),
