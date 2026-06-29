@@ -41,8 +41,8 @@ export function FinalReport({ report }: FinalReportProps) {
     >
       {report ? (
         <div className="space-y-5">
-          <div className="rounded-xl border border-brand-200 bg-brand-50/60 p-4">
-            <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-label text-brand-700">
+          <div className="rounded-lg border border-cyan-200 bg-cyan-50/70 p-4">
+            <h3 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-label text-cyan-800">
               <Target className="h-3.5 w-3.5" />
               Most likely root cause
             </h3>
@@ -50,11 +50,11 @@ export function FinalReport({ report }: FinalReportProps) {
           </div>
 
           <div className="grid gap-3 sm:grid-cols-2">
-            <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+            <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-4">
               <h3 className="text-xs font-semibold text-slate-700">Executive summary</h3>
               <p className="mt-1.5 text-[13px] leading-6 text-slate-600">{report.executiveSummary}</p>
             </div>
-            <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+            <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-4">
               <h3 className="text-xs font-semibold text-slate-700">Recommended next action</h3>
               <p className="mt-1.5 text-[13px] leading-6 text-slate-600">{report.recommendedNextAction}</p>
             </div>

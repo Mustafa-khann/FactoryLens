@@ -16,7 +16,7 @@ function confidenceColor(value: number) {
 function SkepticBanner({ review }: { review: SkepticReview }) {
   const dropped = review.confidenceAfter < review.confidenceBefore;
   return (
-    <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50/70 p-4">
+    <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50/70 p-4">
       <div className="flex items-start justify-between gap-3">
         <h3 className="flex items-center gap-2 text-xs font-semibold text-amber-800">
           <ShieldQuestion className="h-4 w-4" />

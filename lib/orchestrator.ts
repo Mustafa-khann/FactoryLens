@@ -1,19 +1,42 @@
 import { buildFullInvestigationMessages, buildRepairMessages, buildSkepticMessages, buildVisionMessages } from "./agents";
-import { callCerebrasChatCompletion, type CerebrasCompletionResult } from "./cerebras";
+import { callCerebrasChatCompletion, type CerebrasCompletionResult, type ChatMessage } from "./cerebras";
+import { callGeminiChatCompletion, type GeminiCompletionResult } from "./gemini";
 import { investigationResultResponseFormat, skepticResponseFormat, visionResponseFormat } from "./schema";
 import {
   DEFAULT_CEREBRAS_MODEL,
+  DEFAULT_GEMINI_MODEL,
   type AnalysisResponse,
   type AnalysisUsage,
   type InvestigationResult,
   type MissingDataRequest,
+  type ModelComparison,
+  type ModelProvider,
   type PipelineTelemetry,
+  type ReasoningEffort,
   type SkepticReview,
   type VisionObservations,
 } from "./types";
 
 /** Typical sustained output rate (tokens/sec) for a GPU-served build of a model this size — used only to frame the speedup. */
 const GPU_BASELINE_TOKENS_PER_SEC = 55;
+
+type CompletionResult = CerebrasCompletionResult | GeminiCompletionResult;
+
+type ChatCompletionCall = (options: {
+  messages: ChatMessage[];
+  responseFormat?: unknown;
+  temperature?: number;
+  maxTokens?: number;
+  reasoningEffort?: ReasoningEffort;
+}) => Promise<CompletionResult>;
+
+interface ProviderRuntime {
+  provider: ModelProvider;
+  providerLabel: string;
+  model: string;
+  modelLabel: string;
+  call: ChatCompletionCall;
+}
 
 interface SkepticOutput {
   overallAssessment: string;
@@ -52,7 +75,27 @@ function isInvestigationResult(value: unknown): value is InvestigationResult {
   return typeof value.xPost === "string" && typeof value.discordSubmission === "string";
 }
 
-/** Accumulates token/latency telemetry across every Gemma 4 call in the pipeline. */
+function getProviderRuntime(provider: ModelProvider): ProviderRuntime {
+  if (provider === "gemini") {
+    return {
+      provider,
+      providerLabel: "Gemini API",
+      model: process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
+      modelLabel: "Gemini",
+      call: callGeminiChatCompletion,
+    };
+  }
+
+  return {
+    provider: "cerebras",
+    providerLabel: "Cerebras",
+    model: process.env.CEREBRAS_MODEL || DEFAULT_CEREBRAS_MODEL,
+    modelLabel: "Gemma 4",
+    call: callCerebrasChatCompletion,
+  };
+}
+
+/** Accumulates token/latency telemetry across every model call in the pipeline. */
 class Telemetry {
   calls = 0;
   promptTokens = 0;
@@ -60,7 +103,9 @@ class Telemetry {
   generationSeconds = 0;
   ttftMs: number | undefined;
 
-  record(result: CerebrasCompletionResult) {
+  constructor(private runtime: ProviderRuntime) {}
+
+  record(result: CompletionResult) {
     this.calls += 1;
     this.promptTokens += result.usage?.prompt_tokens ?? 0;
     this.completionTokens += result.usage?.completion_tokens ?? 0;
@@ -82,7 +127,9 @@ class Telemetry {
     const tokensPerSecond = this.generationSeconds > 0 ? this.completionTokens / this.generationSeconds : undefined;
     const gpuBaselineMs = this.completionTokens > 0 ? (this.completionTokens / GPU_BASELINE_TOKENS_PER_SEC) * 1000 : undefined;
     return {
-      model: process.env.CEREBRAS_MODEL || DEFAULT_CEREBRAS_MODEL,
+      provider: this.runtime.provider,
+      providerLabel: this.runtime.providerLabel,
+      model: this.runtime.model,
       calls: this.calls,
       wallMs,
       tokensPerSecond,
@@ -94,6 +141,7 @@ class Telemetry {
 }
 
 async function runVisionAgent(
+  runtime: ProviderRuntime,
   telemetry: Telemetry,
   incident: Parameters<typeof buildVisionMessages>[0],
   imageDataUrl?: string,
@@ -111,7 +159,7 @@ async function runVisionAgent(
     };
   }
   try {
-    const result = await callCerebrasChatCompletion({
+    const result = await runtime.call({
       messages: buildVisionMessages(incident, imageDataUrl),
       responseFormat: visionResponseFormat,
       temperature: 0.2,
@@ -141,11 +189,12 @@ async function runVisionAgent(
 }
 
 async function runSynthesisAgent(
+  runtime: ProviderRuntime,
   telemetry: Telemetry,
   incident: Parameters<typeof buildFullInvestigationMessages>[0],
   visionFindings: string[],
 ): Promise<{ result: InvestigationResult; warning?: string }> {
-  const first = await callCerebrasChatCompletion({
+  const first = await runtime.call({
     messages: buildFullInvestigationMessages(incident, undefined, visionFindings),
     responseFormat: investigationResultResponseFormat,
     temperature: 0.2,
@@ -157,7 +206,7 @@ async function runSynthesisAgent(
     return { result: first.parsedJson };
   }
 
-  const repaired = await callCerebrasChatCompletion({
+  const repaired = await runtime.call({
     messages: buildRepairMessages(first.outputText),
     responseFormat: investigationResultResponseFormat,
     temperature: 0.1,
@@ -166,19 +215,20 @@ async function runSynthesisAgent(
   telemetry.record(repaired);
 
   if (!isInvestigationResult(repaired.parsedJson)) {
-    throw new Error("Gemma 4 structured output did not match the FactoryLens schema after one repair attempt.");
+    throw new Error(`${runtime.modelLabel} structured output did not match the FactoryLens schema after one repair attempt.`);
   }
   return { result: repaired.parsedJson, warning: "Structured output required one schema repair pass before rendering." };
 }
 
 async function runSkepticAgent(
+  runtime: ProviderRuntime,
   telemetry: Telemetry,
   incident: Parameters<typeof buildSkepticMessages>[0],
   result: InvestigationResult,
   hasImage: boolean,
 ): Promise<SkepticOutput | undefined> {
   try {
-    const response = await callCerebrasChatCompletion({
+    const response = await runtime.call({
       messages: buildSkepticMessages(incident, result.hypotheses, hasImage),
       responseFormat: skepticResponseFormat,
       temperature: 0.2,
@@ -229,22 +279,24 @@ function applySkepticReview(result: InvestigationResult, skeptic: SkepticOutput)
 }
 
 /**
- * Runs the full multi-agent investigation pipeline on Gemma 4 / Cerebras:
+ * Runs the full multi-agent investigation pipeline:
  *   Vision Inspector (multimodal) → Synthesis (8 agents) → Skeptic (adversarial revision).
  */
 export async function runInvestigationPipeline(
   incident: Parameters<typeof buildFullInvestigationMessages>[0],
   imageDataUrl?: string,
+  options: { provider?: ModelProvider } = {},
 ): Promise<AnalysisResponse> {
-  const telemetry = new Telemetry();
+  const runtime = getProviderRuntime(options.provider ?? "cerebras");
+  const telemetry = new Telemetry(runtime);
   const startedAt = Date.now();
 
-  const vision = await runVisionAgent(telemetry, incident, imageDataUrl);
-  const { result: synthesizedRaw, warning } = await runSynthesisAgent(telemetry, incident, vision.observations);
+  const vision = await runVisionAgent(runtime, telemetry, incident, imageDataUrl);
+  const { result: synthesizedRaw, warning } = await runSynthesisAgent(runtime, telemetry, incident, vision.observations);
   const synthesized = normalizeConfidences(synthesizedRaw);
 
   const withVision: InvestigationResult = { ...synthesized, visionObservations: vision };
-  const skeptic = await runSkepticAgent(telemetry, incident, withVision, Boolean(imageDataUrl));
+  const skeptic = await runSkepticAgent(runtime, telemetry, incident, withVision, Boolean(imageDataUrl));
   const result = skeptic ? applySkepticReview(withVision, skeptic) : withVision;
 
   const wallMs = Date.now() - startedAt;
@@ -263,4 +315,54 @@ export async function runInvestigationPipeline(
     pipeline,
     result,
   };
+}
+
+function summarizeModelComparison(analysis: AnalysisResponse): ModelComparison {
+  const pipeline = analysis.pipeline;
+  const topHypothesis = analysis.result.hypotheses.find((hypothesis) => hypothesis.rank === 1) ?? analysis.result.hypotheses[0];
+  return {
+    provider: pipeline?.provider ?? "gemini",
+    providerLabel: pipeline?.providerLabel ?? "Gemini API",
+    model: pipeline?.model ?? DEFAULT_GEMINI_MODEL,
+    label: "Gemini SOTA comparison",
+    status: "complete",
+    elapsedMs: analysis.elapsedMs,
+    usage: analysis.usage,
+    speed: analysis.speed,
+    pipeline,
+    rootCause: analysis.result.finalReport.mostLikelyRootCause,
+    confidenceLevel: analysis.result.finalReport.confidenceLevel,
+    topHypothesis: topHypothesis?.hypothesis,
+    topConfidence: topHypothesis?.confidence,
+  };
+}
+
+export async function runGeminiModelComparison(
+  incident: Parameters<typeof buildFullInvestigationMessages>[0],
+  imageDataUrl?: string,
+): Promise<ModelComparison> {
+  if (!process.env.GEMINI_API_KEY) {
+    return {
+      provider: "gemini",
+      providerLabel: "Gemini API",
+      model: process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
+      label: "Gemini SOTA comparison",
+      status: "skipped",
+      message: "Set GEMINI_API_KEY to compare Gemma 4 on Cerebras against Gemini.",
+    };
+  }
+
+  try {
+    const analysis = await runInvestigationPipeline(incident, imageDataUrl, { provider: "gemini" });
+    return summarizeModelComparison(analysis);
+  } catch (error) {
+    return {
+      provider: "gemini",
+      providerLabel: "Gemini API",
+      model: process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
+      label: "Gemini SOTA comparison",
+      status: "failed",
+      message: error instanceof Error ? error.message : "Gemini comparison failed.",
+    };
+  }
 }

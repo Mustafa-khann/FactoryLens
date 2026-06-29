@@ -1,9 +1,11 @@
 export const DEFAULT_CEREBRAS_MODEL = "gemma-4-31b";
+export const DEFAULT_GEMINI_MODEL = "gemini-2.5-pro";
 
 export type IncidentSeverity = "low" | "medium" | "high" | "critical";
 export type TimelineSeverity = "info" | "warning" | "critical";
 export type AgentStatus = "waiting" | "investigating" | "complete" | "failed";
 export type InvestigationMode = "live" | "mock";
+export type ModelProvider = "cerebras" | "gemini";
 export type ReasoningEffort = "none" | "low" | "medium" | "high";
 
 export interface TimelineEvent {
@@ -94,6 +96,8 @@ export interface SkepticReview {
 
 /** Telemetry that makes Cerebras speed concrete: how many Gemma 4 calls, how fast, vs a GPU baseline. */
 export interface PipelineTelemetry {
+  provider: ModelProvider;
+  providerLabel: string;
   model: string;
   calls: number;
   wallMs: number;
@@ -102,6 +106,23 @@ export interface PipelineTelemetry {
   ttftMs?: number;
   /** Estimated wall time for the same work on a typical GPU-served provider. */
   gpuBaselineMs?: number;
+}
+
+export interface ModelComparison {
+  provider: ModelProvider;
+  providerLabel: string;
+  model: string;
+  label: string;
+  status: "complete" | "skipped" | "failed";
+  message?: string;
+  elapsedMs?: number;
+  usage?: AnalysisUsage;
+  speed?: SpeedMetrics;
+  pipeline?: PipelineTelemetry;
+  rootCause?: string;
+  confidenceLevel?: "low" | "medium" | "high";
+  topHypothesis?: string;
+  topConfidence?: number;
 }
 
 export interface MissingDataRequest {
@@ -168,6 +189,7 @@ export interface AnalysisResponse {
   timeInfo?: unknown;
   speed: SpeedMetrics;
   pipeline?: PipelineTelemetry;
+  comparisons?: ModelComparison[];
   result: InvestigationResult;
 }
 

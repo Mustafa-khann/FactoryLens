@@ -1,6 +1,6 @@
 "use client";
 
-import { FileText, ImagePlus, Shuffle, Sparkles, X } from "lucide-react";
+import { ChevronDown, FileText, ImagePlus, Shuffle, Sparkles, X } from "lucide-react";
 import type { ImageEvidenceMeta, Incident, IncidentSeverity } from "@/lib/types";
 import { Panel } from "./ui/Panel";
 import { Button } from "./ui/Button";
@@ -20,19 +20,34 @@ interface IncidentInputProps {
 const supportedMachineTypes = ["robotic arm", "conveyor", "autonomous rover", "drone", "CNC spindle", "packaging line", "pump/motor system"];
 
 const inputClass =
-  "w-full min-w-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-[13px] text-slate-900 shadow-sm outline-none transition-colors placeholder:text-slate-400 hover:border-slate-400 focus:border-brand-500 focus:ring-2 focus:ring-brand-100";
+  "w-full min-w-0 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[13px] text-slate-950 shadow-sm outline-none transition-colors placeholder:text-slate-400 hover:border-slate-300 focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100";
 
-const textareaClass = `${inputClass} min-h-[112px] resize-y font-mono text-xs leading-5 thin-scrollbar`;
+const textareaClass = `${inputClass} min-h-[104px] resize-y font-mono text-xs leading-5 thin-scrollbar`;
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
     <label className="block space-y-1.5">
-      <span className="flex items-center justify-between">
-        <span className="text-xs font-medium text-slate-700">{label}</span>
+      <span className="flex items-center justify-between gap-3">
+        <span className="text-xs font-semibold text-slate-700">{label}</span>
         {hint ? <span className="font-mono text-[11px] text-slate-400">{hint}</span> : null}
       </span>
       {children}
     </label>
+  );
+}
+
+function EvidenceBlock({ title, hint, open, children }: { title: string; hint?: string; open?: boolean; children: React.ReactNode }) {
+  return (
+    <details className="group border-t border-slate-100" open={open}>
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50">
+        <span>{title}</span>
+        <span className="flex items-center gap-2 text-[11px] font-normal text-slate-400">
+          {hint}
+          <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+        </span>
+      </summary>
+      <div className="px-4 pb-4">{children}</div>
+    </details>
   );
 }
 
@@ -56,6 +71,7 @@ export function IncidentInput({
   loading,
 }: IncidentInputProps) {
   const update = <K extends keyof Incident,>(key: K, value: Incident[K]) => setIncident({ ...incident, [key]: value });
+  const logRows = incident.logs.split("\n").filter(Boolean).length;
 
   async function handleImage(file?: File) {
     if (!file) {
@@ -75,19 +91,18 @@ export function IncidentInput({
 
   return (
     <Panel
-      title="Incident"
-      subtitle="Configure the evidence to investigate."
+      title="Evidence Console"
+      subtitle="Scenario, machine signals, and field notes."
       icon={<FileText className="h-4 w-4" />}
       trailing={<StatusBadge value={incident.severity} tone="severity" dot />}
       bodyClassName="p-0"
     >
-      <fieldset disabled={loading} className="min-w-0 divide-y divide-slate-100 disabled:opacity-60">
-        {/* Quick-start */}
-        <div className="space-y-3 bg-slate-50/60 p-5">
+      <fieldset disabled={loading} className="min-w-0 disabled:opacity-60">
+        <div className="space-y-3 border-b border-slate-100 p-4">
           <Field label="Demo incident">
             <select className={inputClass} value={incident.id.startsWith("demo-") ? incident.id : ""} onChange={(event) => onSelectDemo(event.target.value)}>
               <option value="" disabled>
-                Select a demo case…
+                Select a demo case...
               </option>
               {demoCases.map((demo) => (
                 <option key={demo.id} value={demo.id}>
@@ -97,9 +112,9 @@ export function IncidentInput({
             </select>
           </Field>
 
-          <Field label="Or generate a synthetic incident">
-            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
-              <select className={inputClass} defaultValue={incident.machineType.toLowerCase()}>
+          <Field label="Synthetic incident">
+            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] lg:grid-cols-1 xl:grid-cols-[minmax(0,1fr)_auto]">
+              <select key={incident.machineType} className={inputClass} defaultValue={incident.machineType.toLowerCase()}>
                 {supportedMachineTypes.map((machineType) => (
                   <option key={machineType} value={machineType}>
                     {machineType}
@@ -121,46 +136,47 @@ export function IncidentInput({
           </Field>
         </div>
 
-        {/* Details */}
-        <div className="space-y-4 p-5">
-          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,0.7fr)]">
-            <Field label="Incident title">
-              <input className={inputClass} value={incident.incidentTitle} onChange={(event) => update("incidentTitle", event.target.value)} />
-            </Field>
+        <div className="space-y-3 p-4">
+          <Field label="Incident title">
+            <input className={inputClass} value={incident.incidentTitle} onChange={(event) => update("incidentTitle", event.target.value)} />
+          </Field>
+
+          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_130px] lg:grid-cols-1 xl:grid-cols-[minmax(0,1fr)_130px]">
             <Field label="Machine type">
               <input className={inputClass} value={incident.machineType} onChange={(event) => update("machineType", event.target.value)} />
             </Field>
+            <Field label="Severity">
+              <select className={inputClass} value={incident.severity} onChange={(event) => update("severity", event.target.value as IncidentSeverity)}>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="critical">Critical</option>
+              </select>
+            </Field>
           </div>
+        </div>
 
-          <Field label="Severity">
-            <select className={inputClass} value={incident.severity} onChange={(event) => update("severity", event.target.value as IncidentSeverity)}>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-              <option value="critical">Critical</option>
-            </select>
-          </Field>
+        <EvidenceBlock title="Logs" hint={`${logRows} rows`} open>
+          <textarea className={textareaClass} value={incident.logs} onChange={(event) => update("logs", event.target.value)} spellCheck={false} />
+        </EvidenceBlock>
 
-          <Field label="Logs" hint={`${incident.logs.split("\n").filter(Boolean).length} rows`}>
-            <textarea className={textareaClass} value={incident.logs} onChange={(event) => update("logs", event.target.value)} spellCheck={false} />
-          </Field>
+        <EvidenceBlock title="Code / config">
+          <textarea className={textareaClass} value={incident.config} onChange={(event) => update("config", event.target.value)} spellCheck={false} />
+        </EvidenceBlock>
 
-          <Field label="Code / config">
-            <textarea className={textareaClass} value={incident.config} onChange={(event) => update("config", event.target.value)} spellCheck={false} />
-          </Field>
+        <EvidenceBlock title="Maintenance notes">
+          <textarea className={textareaClass} value={incident.maintenanceNotes} onChange={(event) => update("maintenanceNotes", event.target.value)} />
+        </EvidenceBlock>
 
-          <Field label="Maintenance notes">
-            <textarea className={textareaClass} value={incident.maintenanceNotes} onChange={(event) => update("maintenanceNotes", event.target.value)} />
-          </Field>
+        <EvidenceBlock title="Operator notes">
+          <textarea className={textareaClass} value={incident.operatorNotes} onChange={(event) => update("operatorNotes", event.target.value)} />
+        </EvidenceBlock>
 
-          <Field label="Operator notes">
-            <textarea className={textareaClass} value={incident.operatorNotes} onChange={(event) => update("operatorNotes", event.target.value)} />
-          </Field>
-
+        <div className="border-t border-slate-100 p-4">
           <Field label="Image evidence">
-            <div className="space-y-2 rounded-lg border border-slate-300 bg-white px-3 py-2.5 shadow-sm">
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-2.5 shadow-sm">
               <div className="flex items-center gap-2">
-                <ImagePlus className={`h-4 w-4 shrink-0 ${image.included ? "text-brand-600" : "text-slate-400"}`} />
+                <ImagePlus className={`h-4 w-4 shrink-0 ${image.included ? "text-cyan-700" : "text-slate-400"}`} />
                 <input
                   type="file"
                   accept="image/png,image/jpeg,image/webp"
@@ -178,9 +194,9 @@ export function IncidentInput({
                   </button>
                 ) : null}
               </div>
-              <p className="flex items-center gap-1.5 truncate text-[11px] text-slate-400">
+              <p className="mt-2 flex items-center gap-1.5 truncate text-[11px] text-slate-400">
                 {!image.included ? <Sparkles className="h-3 w-3 shrink-0" /> : null}
-                <span className="truncate">{image.included ? image.name : "Optional — Vision Inspector will request visual evidence if omitted."}</span>
+                <span className="truncate">{image.included ? image.name : "Optional visual evidence for the Vision Inspector."}</span>
               </p>
             </div>
           </Field>

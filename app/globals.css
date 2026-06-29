@@ -4,7 +4,7 @@
 
 :root {
   color-scheme: light;
-  --canvas: #f5f6f8;
+  --canvas: #eef3f4;
 }
 
 * {
@@ -20,7 +20,14 @@ body {
   min-height: 100vh;
   margin: 0;
   color: #0f172a;
-  background: var(--canvas);
+  background:
+    linear-gradient(90deg, rgba(15, 23, 42, 0.045) 1px, transparent 1px),
+    linear-gradient(0deg, rgba(15, 23, 42, 0.035) 1px, transparent 1px),
+    linear-gradient(180deg, #f7fafb 0%, var(--canvas) 34rem);
+  background-size:
+    48px 48px,
+    48px 48px,
+    auto;
   font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
@@ -42,8 +49,8 @@ button:disabled {
 }
 
 ::selection {
-  background: #c7d2fe;
-  color: #1e1b4b;
+  background: #a5f3fc;
+  color: #082f49;
 }
 
 /* Consistent, accessible focus ring on interactive elements. */
@@ -51,8 +58,26 @@ button:disabled {
   outline: none;
   box-shadow:
     0 0 0 2px #ffffff,
-    0 0 0 4px rgba(79, 70, 229, 0.45);
+    0 0 0 4px rgba(8, 145, 178, 0.38);
   border-radius: 0.5rem;
+}
+
+.factory-hero::before {
+  position: absolute;
+  inset: 0;
+  content: "";
+  background:
+    linear-gradient(90deg, rgba(103, 232, 249, 0.13) 1px, transparent 1px),
+    linear-gradient(0deg, rgba(103, 232, 249, 0.11) 1px, transparent 1px);
+  background-size: 36px 36px;
+  mask-image: linear-gradient(90deg, black, transparent 78%);
+}
+
+.factory-hero::after {
+  position: absolute;
+  inset: 0;
+  content: "";
+  background: linear-gradient(135deg, rgba(8, 47, 73, 0.76), rgba(15, 23, 42, 0.18) 52%, rgba(2, 6, 23, 0.45));
 }
 
 .thin-scrollbar {

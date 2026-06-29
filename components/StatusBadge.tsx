@@ -2,7 +2,7 @@ import type { AgentStatus, IncidentSeverity, TimelineSeverity } from "@/lib/type
 
 const statusClasses: Record<AgentStatus, string> = {
   waiting: "border-slate-200 bg-slate-50 text-slate-500",
-  investigating: "border-brand-200 bg-brand-50 text-brand-700",
+  investigating: "border-cyan-200 bg-cyan-50 text-cyan-700",
   complete: "border-emerald-200 bg-emerald-50 text-emerald-700",
   failed: "border-red-200 bg-red-50 text-red-700",
 };
@@ -18,7 +18,7 @@ const severityClasses: Record<IncidentSeverity | TimelineSeverity, string> = {
 
 export const dotColor: Record<string, string> = {
   waiting: "bg-slate-400",
-  investigating: "bg-brand-500",
+  investigating: "bg-cyan-600",
   complete: "bg-emerald-500",
   failed: "bg-red-500",
   low: "bg-slate-400",

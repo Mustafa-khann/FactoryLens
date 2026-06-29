@@ -11,7 +11,7 @@ interface ImageEvidencePanelProps {
 }
 
 function formatBytes(value?: number) {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / (1024 * 1024)).toFixed(2)} MB`;
@@ -71,7 +71,7 @@ export function ImageEvidencePanel({ image, mode, loading, vision }: ImageEviden
           <span className="font-mono text-slate-800">{sentValue}</span>
         </Cell>
         <Cell label="Format">
-          <p className="truncate font-mono text-slate-800">{image.format?.replace("image/", "") || "—"}</p>
+          <p className="truncate font-mono text-slate-800">{image.format?.replace("image/", "") || "-"}</p>
         </Cell>
         <Cell label="Size">
           <p className="font-mono tabular-nums text-slate-800">{formatBytes(image.sizeBytes)}</p>
@@ -79,14 +79,14 @@ export function ImageEvidencePanel({ image, mode, loading, vision }: ImageEviden
       </div>
 
       {vision ? (
-        <div className="space-y-4 rounded-xl border border-slate-200 bg-white p-4">
+        <div className="space-y-4 rounded-lg border border-slate-200 bg-white p-4">
           {vision.conditionSummary ? (
             <div className="flex items-start gap-2.5">
-              <ImageIcon className="mt-0.5 h-4 w-4 shrink-0 text-brand-600" />
+              <ImageIcon className="mt-0.5 h-4 w-4 shrink-0 text-cyan-700" />
               <p className="text-[13px] font-medium leading-5 text-slate-800">{vision.conditionSummary}</p>
             </div>
           ) : null}
-          <FindingList icon={<Eye className="h-3.5 w-3.5" />} title="Visible observations" items={vision.observations} tint="text-brand-600" />
+          <FindingList icon={<Eye className="h-3.5 w-3.5" />} title="Visible observations" items={vision.observations} tint="text-cyan-700" />
           <FindingList icon={<Camera className="h-3.5 w-3.5" />} title="Evidence to collect" items={vision.requestedEvidence} tint="text-slate-400" />
         </div>
       ) : null}

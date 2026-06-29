@@ -12,7 +12,7 @@ const typeStyles: Record<EvidenceGraphNode["type"], { tile: string; chip: string
   config: { tile: "border-blue-200 bg-blue-50/50", chip: "bg-blue-100 text-blue-700" },
   note: { tile: "border-violet-200 bg-violet-50/50", chip: "bg-violet-100 text-violet-700" },
   image: { tile: "border-teal-200 bg-teal-50/50", chip: "bg-teal-100 text-teal-700" },
-  inference: { tile: "border-brand-200 bg-brand-50/50", chip: "bg-brand-100 text-brand-700" },
+  inference: { tile: "border-cyan-200 bg-cyan-50/60", chip: "bg-cyan-100 text-cyan-800" },
   fault: { tile: "border-red-200 bg-red-50/60", chip: "bg-red-100 text-red-700" },
 };
 

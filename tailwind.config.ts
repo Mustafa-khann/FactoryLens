@@ -24,7 +24,7 @@ const config: Config = {
         sans: ["var(--font-geist-sans)", "Inter", "ui-sans-serif", "system-ui", "sans-serif"],
       },
       letterSpacing: {
-        label: "0.06em",
+        label: "0",
       },
       boxShadow: {
         card: "0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06)",

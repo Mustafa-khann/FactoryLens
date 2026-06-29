@@ -12,14 +12,14 @@ interface AgentWarRoomProps {
 
 function AgentIcon({ status }: { status: AgentDisplay["status"] }) {
   if (status === "complete") return <CheckCircle2 className="h-4 w-4 text-emerald-600" />;
-  if (status === "investigating") return <Activity className="h-4 w-4 animate-pulse text-brand-600" />;
+  if (status === "investigating") return <Activity className="h-4 w-4 animate-pulse text-cyan-700" />;
   if (status === "failed") return <AlertTriangle className="h-4 w-4 text-red-600" />;
   return <Circle className="h-4 w-4 text-slate-300" />;
 }
 
 const rowTint: Record<AgentDisplay["status"], string> = {
   waiting: "border-slate-200 bg-white",
-  investigating: "border-brand-200 bg-brand-50/40",
+  investigating: "border-cyan-200 bg-cyan-50/60",
   complete: "border-slate-200 bg-white",
   failed: "border-red-200 bg-red-50/40",
 };
@@ -42,13 +42,13 @@ export function AgentWarRoom({ agents, loading, elapsedMs, mode }: AgentWarRoomP
         <div className="mb-1.5 flex items-center justify-between text-xs">
           <span className="font-medium text-slate-600">Progress</span>
           <span className="font-mono tabular-nums text-slate-500">
-            {completed}/{total} agents · {(elapsedMs / 1000).toFixed(1)}s
+            {completed}/{total} agents - {(elapsedMs / 1000).toFixed(1)}s
           </span>
         </div>
         <div className="relative h-1.5 overflow-hidden rounded-full bg-slate-100">
-          <div className="h-full rounded-full bg-brand-600 transition-all duration-500 ease-out" style={{ width: `${progress}%` }} />
+          <div className="h-full rounded-full bg-cyan-700 transition-all duration-500 ease-out" style={{ width: `${progress}%` }} />
           {loading && progress < 100 ? (
-            <div className="absolute inset-y-0 left-0 w-1/4 animate-bar-indeterminate rounded-full bg-brand-400/40" />
+            <div className="absolute inset-y-0 left-0 w-1/4 animate-bar-indeterminate rounded-full bg-cyan-400/45" />
           ) : null}
         </div>
       </div>
@@ -88,13 +88,13 @@ export function AgentWarRoom({ agents, loading, elapsedMs, mode }: AgentWarRoomP
                   ) : null}
                 </div>
               ) : active ? (
-                <p className="mt-3 inline-flex items-center gap-2 pl-10 text-xs text-brand-600">
+                <p className="mt-3 inline-flex items-center gap-2 pl-10 text-xs text-cyan-700">
                   <span className="flex gap-1">
-                    <span className="h-1.5 w-1.5 rounded-full bg-brand-500 animate-pulse-soft" />
-                    <span className="h-1.5 w-1.5 rounded-full bg-brand-500 animate-pulse-soft [animation-delay:200ms]" />
-                    <span className="h-1.5 w-1.5 rounded-full bg-brand-500 animate-pulse-soft [animation-delay:400ms]" />
+                    <span className="h-1.5 w-1.5 rounded-full bg-cyan-600 animate-pulse-soft" />
+                    <span className="h-1.5 w-1.5 rounded-full bg-cyan-600 animate-pulse-soft [animation-delay:200ms]" />
+                    <span className="h-1.5 w-1.5 rounded-full bg-cyan-600 animate-pulse-soft [animation-delay:400ms]" />
                   </span>
-                  Analyzing evidence…
+                  Analyzing evidence...
                 </p>
               ) : null}
             </article>

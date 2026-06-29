@@ -14,13 +14,13 @@ interface SpeedPanelProps {
 }
 
 function formatMs(value?: number) {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
   if (value < 1000) return `${Math.round(value)} ms`;
   return `${(value / 1000).toFixed(2)} s`;
 }
 
 function formatRate(value?: number) {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
   return `${Math.round(value).toLocaleString()}`;
 }
 
@@ -46,7 +46,7 @@ export function SpeedPanel({ analysis, elapsedMs, speedDemo, speedDemoLoading, o
   const tokps = pipeline?.tokensPerSecond ?? analysis?.speed.outputTokensPerSecond;
   const speedup = gpuMs && wallMs ? gpuMs / wallMs : undefined;
 
-  // Bar widths (Cerebras pinned small, GPU baseline scaled relative — capped for layout).
+  // Bar widths: Cerebras pinned small, GPU baseline scaled relative and capped for layout.
   const ratio = speedup ? Math.min(speedup, 30) : 1;
   const cerebrasWidth = 100 / (1 + ratio);
   const gpuWidth = 100 - cerebrasWidth;
@@ -54,7 +54,7 @@ export function SpeedPanel({ analysis, elapsedMs, speedDemo, speedDemoLoading, o
   return (
     <Panel
       title="Cerebras Speed"
-      subtitle="A full multi-agent investigation in seconds — the workflow only works at this latency."
+      subtitle="A full multi-agent investigation in seconds. The workflow only works at this latency."
       icon={<Zap className="h-4 w-4" />}
       accent="brand"
       trailing={
@@ -67,7 +67,7 @@ export function SpeedPanel({ analysis, elapsedMs, speedDemo, speedDemoLoading, o
     >
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         <Stat icon={<Timer className="h-3.5 w-3.5" />} label="Total time" value={formatMs(wallMs)} />
-        <Stat icon={<Layers className="h-3.5 w-3.5" />} label="Gemma 4 calls" value={pipeline ? String(pipeline.calls) : "—"} />
+        <Stat icon={<Layers className="h-3.5 w-3.5" />} label="Gemma 4 calls" value={pipeline ? String(pipeline.calls) : "-"} />
         <Stat icon={<Gauge className="h-3.5 w-3.5" />} label="Throughput" value={formatRate(tokps)} unit="tok/s" />
         <Stat icon={<Zap className="h-3.5 w-3.5" />} label="First token" value={formatMs(pipeline?.ttftMs ?? analysis?.speed.timeToFirstTokenMs)} />
       </div>
@@ -77,17 +77,17 @@ export function SpeedPanel({ analysis, elapsedMs, speedDemo, speedDemoLoading, o
         <div className="mb-2.5 flex items-center justify-between">
           <p className="text-[11px] font-semibold uppercase tracking-label text-slate-500">Latency vs GPU baseline</p>
           {speedup ? (
-            <span className="rounded-full bg-brand-50 px-2 py-0.5 text-xs font-semibold text-brand-700">≈{speedup.toFixed(0)}× faster</span>
+            <span className="rounded-full bg-cyan-50 px-2 py-0.5 text-xs font-semibold text-cyan-800">{speedup.toFixed(0)}x faster</span>
           ) : null}
         </div>
         <div className="space-y-2">
           <div>
             <div className="mb-1 flex items-center justify-between text-[11px]">
-              <span className="font-medium text-brand-700">Cerebras · {pipeline?.model ?? DEFAULT_CEREBRAS_MODEL}</span>
+              <span className="font-medium text-cyan-800">Cerebras - {pipeline?.model ?? DEFAULT_CEREBRAS_MODEL}</span>
               <span className="font-mono tabular-nums text-slate-600">{formatMs(wallMs)}</span>
             </div>
             <div className="h-2.5 overflow-hidden rounded-full bg-slate-100">
-              <div className="h-full rounded-full bg-brand-600" style={{ width: `${Math.max(4, cerebrasWidth)}%` }} />
+              <div className="h-full rounded-full bg-cyan-700" style={{ width: `${Math.max(4, cerebrasWidth)}%` }} />
             </div>
           </div>
           <div>

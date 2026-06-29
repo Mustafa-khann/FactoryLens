@@ -423,6 +423,8 @@ export function createMockInvestigation(incident: Incident, options: MockOptions
   const calls = (imageIncluded ? 1 : 0) + 2; // vision (if image) + synthesis + skeptic
   const tokensPerSecond = 900 + (seed % 400);
   const pipeline: PipelineTelemetry = {
+    provider: "cerebras",
+    providerLabel: "Cerebras",
     model: process.env.CEREBRAS_MODEL || DEFAULT_CEREBRAS_MODEL,
     calls,
     wallMs: elapsedMs,
